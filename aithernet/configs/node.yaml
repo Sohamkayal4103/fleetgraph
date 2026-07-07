@@ -1,0 +1,459 @@
+# Aithernet node configuration.
+#
+# Any field below can be overridden at runtime by an environment variable of the
+# form AITHERNET_<FIELD> (e.g. AITHERNET_PORT=9000, AITHERNET_DATABASE_URL=...).
+
+# Stable identity for this node. Generate a fresh UUID per physical deployment.
+node_id: "00000000-0000-4000-8000-000000000001"
+node_name: "aithernet-node-local"
+
+# SQLAlchemy database URL. SQLite is the Stage 1 default.
+database_url: "sqlite:///./aithernet.db"
+
+# API bind address.
+host: "127.0.0.1"
+port: 8080
+
+# Logging verbosity passed through to uvicorn / the runtime logger.
+log_level: "info"
+
+# CORS origins permitted to call the API from a browser (Stage 8 web dashboard). Defaults
+# to all origins for a local, unauthenticated operator tool; restrict for shared
+# deployments. Override via AITHERNET_CORS_ALLOW_ORIGINS (comma-separated), e.g.
+#   export AITHERNET_CORS_ALLOW_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
+cors_allow_origins:
+  - "*"
+
+# Coordinator agent. Provider selection is environment-driven. `env:VAR_NAME` values are
+# resolved from the environment by the config loader; an unset/blank variable falls back to
+# the field default (so provider defaults to openai_compatible and executable to gemini).
+#
+#   gemini_cli         -> reasons via the authenticated Gemini CLI (executable: gemini);
+#                         set AITHERNET_COORDINATOR_MODEL empty to use the CLI's default model.
+#   openai_compatible  -> reasons via an OpenAI-compatible HTTP API (e.g. local Ollama);
+#                         set base_url / api_key / model.
+#
+# Gemini reasons; Aithernet executes. The Gemini coordinator runs headless with built-in
+# tools denied and any reported tool call treated as a failure — it never edits files,
+# runs shells, calls MCP servers, or performs external actions itself.
+coordinator:
+  provider: env:AITHERNET_COORDINATOR_PROVIDER         # gemini_cli | openai_compatible | anthropic
+  model: env:AITHERNET_COORDINATOR_MODEL               # blank -> the CLI/provider default model
+  timeout_seconds: env:AITHERNET_COORDINATOR_TIMEOUT_SECONDS   # falls back to 60
+  temperature: 0.2
+  # -- gemini_cli --
+  executable: env:AITHERNET_COORDINATOR_EXECUTABLE     # falls back to "gemini"
+  # working_directory: null   # optional override of the sandboxed runtime dir
+  # -- openai_compatible / anthropic --
+  base_url: env:AITHERNET_COORDINATOR_BASE_URL
+  api_key: env:AITHERNET_COORDINATOR_API_KEY
+  # max_tokens: 1024            # used by the Anthropic provider
+  # allow_unauthenticated: false  # set true only for local/self-hosted servers
+
+# Coding agent (Stage 3) — the implementation/execution worker. The Stage 3 provider is
+# Claude Code, run through its CLI in non-interactive mode. `env:VAR_NAME` values resolve
+# from the environment; an unset variable falls back to the field default below, so the
+# node is usable out of the box. The coding agent reports "configured" only when its
+# executable can actually be resolved.
+coding_agent:
+  # provider + executable must MATCH: claude_code expects the Claude Code CLI, codex_cli
+  # expects the Codex CLI. A mismatch (e.g. claude_code with the codex binary) is reported
+  # "not configured" by the readiness identity probe rather than run with the wrong flags.
+  provider: env:AITHERNET_CODING_AGENT_PROVIDER       # claude_code | codex_cli; falls back to "claude_code"
+  executable: env:AITHERNET_CODING_AGENT_EXECUTABLE   # falls back to "claude" (set to "codex" for codex_cli)
+  workspace: env:AITHERNET_CODING_AGENT_WORKSPACE     # falls back to "./workspace"
+  timeout_seconds: 600
+  output_format: text                                 # used by the claude_code provider
+  extra_args: []
+  # model: claude-sonnet-4-6   # optional: model passed to the coding agent (-m for codex)
+  # env: {}                    # optional extra subprocess env (never reported by status)
+
+# GNU Radio MCP (Stage 4) — connection to an external Model Context Protocol server.
+# The intended/default server is the ready-made yoelbassin/gr-mcp project (do NOT vendor
+# it here). This mirrors gr-mcp's stdio config: `uv --directory /path/to/gr-mcp run main.py`.
+# `env:VAR_NAME` values resolve from the environment. Normally you set NOTHING here: when
+# `command` is unset and the managed `rf-mcp` component is installed (`aithernet components
+# install rf-mcp`), the loader auto-wires the launch from the component lock + install prefix
+# — no developer checkout, no manual env vars. If neither a command nor a managed component is
+# present, the MCP server is reported unconfigured and any tool call fails with a clear error
+# rather than faking GNU Radio behavior. To override (e.g. a developer gr-mcp checkout), set:
+#   export AITHERNET_GNURADIO_MCP_COMMAND=uv
+#   export AITHERNET_GR_MCP_DIR=/absolute/path/to/gr-mcp
+gnuradio_mcp:
+  provider: stdio
+  command: env:AITHERNET_GNURADIO_MCP_COMMAND
+  args:
+    - "main.py"
+  cwd: env:AITHERNET_GR_MCP_DIR
+  timeout_seconds: 30
+  # Max size of a single JSON-RPC frame read from the server's stdout/stderr. asyncio's
+  # 64 KiB default is too small for large tool results (e.g. gr-mcp's full block catalog
+  # from get_all_available_blocks); oversized frames raise a clear MCPClientError
+  # (structured 502) instead of crashing the backend with a raw ValueError.
+  stdio_stream_limit_bytes: 16777216   # 16 MiB
+  # Persistent MCP session (Stage 11B): one long-lived gr-mcp subprocess per node, reused
+  # for many atomic calls. These are infrastructure recovery limits, NOT autonomy — the
+  # session never replays a failed call and never runs an unrequested sequence of actions.
+  session:
+    autostart: true                    # start the session on node startup when configured
+    auto_restart: true                 # bounded recovery if the subprocess dies unexpectedly
+    max_restart_attempts: 3            # max consecutive auto-restart attempts before giving up
+    restart_initial_backoff_seconds: 1
+    restart_max_backoff_seconds: 10
+    shutdown_grace_seconds: 5          # grace before killing the subprocess on stop
+    max_in_flight_requests: 1          # concurrent JSON-RPC requests (conservative default)
+    stderr_buffer_bytes: 262144        # bounded in-memory stderr ring (256 KiB)
+  env: {}
+
+# Autonomous mission execution (Stage 12). The worker executes a sequence of ATOMIC,
+# model-selected steps — one coordinator decision and at most one route per iteration —
+# reassessing after every real result, until the coordinator concludes the mission
+# (complete/wait/blocked) or infrastructure stops it (budget/pause/cancel/lease loss).
+#
+# Autonomous loop != predetermined workflow: the coordinator chooses each next action from
+# the latest observed state. One atomic step != one whole mission: a mission is many steps.
+# The budgets below are runaway-prevention limits, NOT autonomy levels; per-run overrides
+# may only LOWER them (they are clamped to these maximums).
+mission_execution:
+  enabled: true                        # run the background worker (manual /step still works when false)
+  worker_count: 1                      # bounded pool; one task per mission regardless
+  poll_interval_seconds: 1.0           # how often the worker polls for queued runs
+  lease_duration_seconds: 30           # DB lease validity window
+  lease_renew_interval_seconds: 10     # heartbeat interval (MUST be < lease_duration_seconds)
+  shutdown_grace_seconds: 15           # grace for in-flight iterations to finish on shutdown
+  recovery_enabled: true               # requeue interrupted active runs after a restart
+  reassess_after_failure: true         # feed a failed route result back to the coordinator
+  default_budgets:
+    max_iterations: 25                 # atomic steps per run
+    max_elapsed_seconds: 1800          # wall-clock ceiling per run
+    max_coordinator_calls: 25
+    max_node_state_actions: 10
+    max_coding_agent_actions: 5
+    max_mcp_actions: 15
+    max_response_actions: 10
+    max_consecutive_failures: 3        # consecutive failed/invalid steps before blocking
+    max_context_characters: 100000
+  context:
+    recent_steps: 20                   # prior steps summarized into each context
+    recent_mcp_calls: 10
+    recent_coding_tasks: 10
+    recent_events: 20
+    result_preview_characters: 8000    # per-result preview cap (never raw full bodies)
+    max_total_characters: 100000       # hard ceiling on the assembled context
+# --- Authenticated inter-node agent transport (Stage 13A) ---
+# Turns external-agent records into a real signed network transport: a stable Ed25519 node
+# identity, signed canonical envelopes, explicit peer trust, a durable outbox/inbox with
+# idempotent deduplication, signed delivery acknowledgements, and a delivery worker.
+# This stage establishes transport reliability + identity ONLY. The coordinator does NOT yet
+# choose peer messages and replies do NOT yet resume missions (Stage 13B); inbound messages
+# are stored as data and never executed. The private key lives OUTSIDE the repo (XDG state by
+# default), never in SQLite, and is never returned/printed/logged.
+agent_transport:
+  enabled: true
+  identity:
+    state_directory: env:AITHERNET_IDENTITY_STATE_DIR   # default: ~/.local/state/aithernet/identity
+    auto_initialize: false             # never silently generate a production identity at startup
+  inbound:
+    enabled: true
+    maximum_payload_bytes: 1048576     # reject oversized inbound bodies
+    accepted_clock_skew_seconds: 120   # tolerated created_at/expires_at skew
+  outbound:
+    enabled: true
+    worker_count: 1                    # bounded delivery pool (one claim per record)
+    poll_interval_seconds: 1.0
+    delivery_lease_seconds: 30         # DB-backed claim lease (recovered if a worker dies)
+    shutdown_grace_seconds: 10
+    connect_timeout_seconds: 5
+    request_timeout_seconds: 30
+    maximum_response_bytes: 1048576
+    max_attempts: 5                    # then dead_letter (retries reuse the same message id)
+    initial_backoff_seconds: 1
+    maximum_backoff_seconds: 60
+    jitter_seconds: 1
+    recovery_enabled: true             # requeue expired in-flight claims after a restart
+  local_development:
+    allow_insecure_http: true          # permit plain-HTTP peers locally (TLS verified for HTTPS)
+
+# --- Coordinator peer messaging & durable reply resumption (Stage 13B) ---
+# Application layer ON TOP of the signed transport above. The coordinator may send ONE message
+# per mission iteration to a TRUSTED peer and durably WAIT for a correlated reply; trusted+
+# AUTHORIZED peers may open coordinator requests that become local missions. Transport trust
+# (key pinning) and application authorization (per-peer permissions) are separate; permission
+# defaults are conservative (a trusted peer may NOT open requests until granted). No secrets here.
+communication:
+  enabled: true                            # set false to disable peer messaging entirely
+  max_text_characters: 8000                # per-message text bound
+  max_data_bytes: 32768                    # per-message structured-data bound
+  max_data_depth: 8                        # reject deeply nested data payloads
+  default_reply_deadline_seconds: 600      # default durable reply-wait deadline
+  max_reply_deadline_seconds: 86400        # hard cap on any reply-wait deadline
+  timeout_poll_interval_seconds: 5         # how often the worker sweeps overdue reply waits
+  inbound_requests_enabled: true           # accept coordinator-addressed requests from peers
+  default_max_inbound_request_bytes: 65536 # per-peer inbound-request payload ceiling (overridable)
+  default_max_concurrent_inbound_missions: 4   # open inbound-request missions per peer (overridable)
+  recent_conversation_messages: 10         # how many recent thread messages to surface in context
+  # Stage 13D.3 remote mission-status synchronization (a node reports its OWN mission lifecycle
+  # to the requesting peer over the durable outbox). Per-peer status permissions default OFF and
+  # are separate from trust + message + artifact permissions. No secrets here.
+  mission_status_enabled: true             # set false to disable status emit/accept entirely
+  status_freshness_seconds: 300            # non-terminal snapshot -> 'stale' after this window
+  recent_status_events: 20                 # recent status events surfaced per snapshot
+  default_max_active_remote_snapshots: 64  # per-peer active-snapshot ceiling (overridable)
+
+# --- Distributed artifact transfer + managed store (Stage 13D.2) ---
+# Binary RF-artifact bytes live ONLY in the managed content-addressed store on disk (never in
+# SQLite/events/prompts/dashboard JSON). Transfer is authorized per-peer SEPARATELY from trust
+# (may_offer/request/receive_artifacts default OFF). The transfer worker is independent of the
+# mission + RF workers. There are NO secrets here.
+artifacts:
+  enabled: true
+  state_directory: env:AITHERNET_ARTIFACT_STATE_DIR   # default: ~/.local/state/aithernet/artifact-store
+  max_artifact_bytes: 536870912            # 512 MiB per-artifact ceiling
+  total_store_quota_bytes: 8589934592      # 8 GiB total managed-store quota
+  default_per_peer_quota_bytes: 2147483648 # 2 GiB per-peer transferred-bytes quota
+  minimum_free_bytes: 536870912            # refuse new transfers below 512 MiB free disk
+  chunk_bytes: 1048576                      # 1 MiB streaming range size
+  grant_ttl_seconds: 900                    # a transfer grant is valid for 15 minutes
+  partial_expiry_seconds: 86400             # abandoned partial files cleaned up after a day
+  worker_enabled: true                      # run the background transfer worker
+  worker_poll_interval_seconds: 1.0
+  max_concurrent_transfers: 2               # global download concurrency
+  default_max_concurrent_transfers_per_peer: 1
+  max_attempts: 8                           # transient-failure retry ceiling (never for permanent)
+  initial_backoff_seconds: 1
+  maximum_backoff_seconds: 120
+  connect_timeout_seconds: 5
+  request_timeout_seconds: 60
+  remote_status_stale_seconds: 120          # (Stage 13D.3) remote mission snapshot staleness window
+
+# --- Multi-RF-backend registry (Stage 13A.5) ---
+# Aithernet operates one or more EXTERNAL RF backends, each as its own MCP subprocess. It
+# never imports a backend's Python modules, never runs Marconi's Claude plugin or skills, and
+# operates every backend only through audited, atomic MCP tool calls. The legacy GNU Radio
+# backend is the stable DEFAULT and autostarts; Marconi is EXPERIMENTAL, opt-in, and does not
+# autostart. Tool names/schemas are discovered live from each server — never hardcoded.
+rf_backends:
+  default_backend: legacy_gr_mcp        # never switched automatically by benchmarks
+  backends:
+    legacy_gr_mcp:
+      display_name: Legacy GNU Radio MCP
+      kind: mcp_stdio
+      enabled: true
+      experimental: false
+      autostart: true                   # preserves the existing Stage 11B autostart
+      # command/cwd come from the existing gnuradio_mcp config (single legacy process).
+    marconi:
+      display_name: Marconi
+      kind: mcp_stdio
+      enabled: true
+      experimental: true                # simulation/file-analysis backend; no live hardware
+      autostart: false                  # opt-in: start explicitly with `aithernet rf backend start marconi`
+      command: env:AITHERNET_MARCONI_COMMAND
+      args: []
+      cwd: env:AITHERNET_MARCONI_DIR
+      workspace: env:AITHERNET_MARCONI_WORKSPACE   # artifact containment boundary
+      environment:
+        MARCONI_WORKSPACE: env:AITHERNET_MARCONI_WORKSPACE
+      timeout_seconds: 60
+      max_in_flight_requests: 1
+
+# -- Managed SDR hardware inventory + leasing (Stage 14B, additive) --
+# OFF by default — a node with no SDR hardware stays fully usable for simulation, coding,
+# coordination, and artifact analysis. When enabled, the inventory worker runs the configured
+# discovery providers on a bounded interval and persists FACTUAL devices/capabilities/health
+# (unknown stays unknown; nothing is invented), and the lease service grants durable,
+# conflict-checked, bounded leases that authorize managed physical-device use. Inventory polling
+# and lease renewal create no MissionStep. The external RF backends are never modified.
+hardware:
+  enabled: false
+  discovery_interval_seconds: 60
+  health_interval_seconds: 30
+  lease_duration_seconds: 120
+  lease_renew_interval_seconds: 30
+  stale_lease_grace_seconds: 30
+  # Operator (non-coordinator) lease acquire/release/revoke from the API/CLI/dashboard. The
+  # coordinator selects only a known device id + bounded purpose via the rf_device route and is
+  # never gated by this flag.
+  operator_lease_actions_enabled: false
+  providers: {}
+    # usrp:  { kind: uhd,   required: false }            # uhd_find_devices on PATH
+    # soapy: { kind: soapy, required: false }            # SoapySDRUtil --find on PATH
+    # lab:   { kind: static, devices: [ { vendor: Ettus, product: B210, serial: "30AD3F8",
+    #          driver: uhd, device_kind: sdr,
+    #          capabilities: { rx: true, tx: true, channels: 2,
+    #                          frequency_ranges: [[70000000, 6000000000]],
+    #                          sample_rate_ranges: [[1000000, 56000000]] } } ] }
+  required_devices: []
+    # - { selector: "30AD3F8", description: "lab B210 (gates readiness when missing)" }
+  bindings: []
+    # - { device_selector: "30AD3F8", backend_id: legacy_gr_mcp, device_args: { driver: uhd } }
+  # -- Real-hardware qualification + RF execution (Stage 14C.1) --
+  # RF flowgraph execution runs in a SEPARATE, independently configurable interpreter (GNU Radio is
+  # typically installed for the system Python, not Aithernet's venv). Aithernet NEVER imports
+  # gnuradio into its own venv. Captures are bounded; bytes go to the artifact store, not SQLite.
+  qualification:
+    gnuradio_python: /usr/bin/python3          # must import gnuradio + gnuradio.iio/soapy
+    capture_timeout_seconds: 60
+    default_sample_rate: 2000000               # conservative initial RX qualification (2 MS/s)
+    default_gain_db: 40                         # manual RX gain
+    default_duration_seconds: 3                 # bounded 3-5 s; never transmits
+    max_duration_seconds: 10
+    default_rx_frequency_hz: 2437000000         # 2.4 GHz ISM (Wi-Fi ch 6)
+    stream_format: CF32
+    retain_raw_capture: true
+    survey_channel_centers_mhz: [2412.0, 2437.0, 2462.0]   # Wi-Fi 1/6/11
+    survey_dwell_seconds: 1.0
+    survey_occupancy_threshold_db: -70.0
+
+# -- Multi-node field operation + soak validation (Stage 14C.2, additive) --
+# Operator-invoked validation of the node under repeated-operation, failure, and long-duration
+# conditions. Read surfaces are always available; disruptive actions (campaign start/stop, soak
+# runs, fault injection, physical TX) require explicit enablement. Fault injection is OFF by
+# default and only performs bounded, predefined actions — never an arbitrary shell/network command.
+# Sampling/lease-cycling/soak create NO MissionStep. Profiles + soak thresholds are explicit config.
+field_validation:
+  enabled: true
+  operator_actions_enabled: false      # gate campaign/soak start (disruptive)
+  fault_injection_enabled: false       # validation-mode only; bounded predefined faults
+  transmit_authorized: false           # physical TX requires explicit operator authorization
+  soak_sample_interval_seconds: 5
+  rest_interval_seconds: 1
+  capture_sample_rate: 2000000
+  capture_gain_db: 40
+  capture_duration_s: 1
+  capture_frequency_hz: 2437000000
+  profiles:
+    smoke_iterations: 3
+    short_soak_seconds: 1800           # 30 min
+    standard_seconds: 14400            # 4 h
+    extended_seconds: 86400            # 24 h
+  thresholds:
+    min_mission_success_ratio: 0.95
+    min_capture_success_ratio: 0.95
+    min_artifact_integrity_ratio: 1.0
+    max_leaked_leases: 0
+    max_orphan_processes: 0
+    min_restart_recovery_success: 1.0
+    min_peer_delivery_success: 0.95
+    max_rss_growth_bytes: 268435456    # 256 MiB unbounded-RSS ceiling
+    max_fd_growth: 256
+    min_disk_free_bytes: 268435456
+    max_provider_error_rate: 0.5
+
+# --- External-agent interoperability gateway (Stage 14D) ---
+# OFF by default. Lets authenticated EXTERNAL (non-Aithernet) programs submit idempotent
+# missions and receive durable signed webhook / WebSocket callbacks with replay. Distinct from
+# the node-to-node peer transport. Webhook + WebSocket delivery stay disabled until explicitly
+# enabled. There are NO secrets here — agent Ed25519 public keys are provisioned by an operator
+# and any bearer credential is stored hashed (shown once).
+external_agents:
+  enabled: false
+  authentication:
+    signed_requests_enabled: true
+    allowed_clock_skew_seconds: 60
+    nonce_retention_seconds: 600
+    bearer_tokens_enabled: false
+  delivery:
+    worker_enabled: true
+    concurrency: 4
+    per_agent_concurrency: 2
+    connect_timeout_seconds: 5
+    response_timeout_seconds: 10
+    maximum_attempts: 8
+    retry_base_seconds: 2
+    retry_max_seconds: 300
+    message_retention_seconds: 604800        # 7 days
+    dead_letter_retention_seconds: 2592000   # 30 days
+    claim_seconds: 30
+    poll_interval_seconds: 1
+  callbacks:                                 # signed webhooks + SSRF policy
+    enabled: false
+    https_required: true
+    allow_private_networks: false            # set true to permit http + approved private CIDRs
+    allowed_hosts: []
+    allowed_cidrs: []
+    allowed_ports: []
+    redirects_enabled: false
+    maximum_redirects: 0
+    maximum_response_bytes: 65536
+    maximum_url_length: 2048
+    verification_required: true
+  websocket:
+    enabled: false
+    maximum_connections: 32
+    per_agent_connections: 4
+    maximum_frame_bytes: 65536
+    heartbeat_seconds: 20
+    idle_timeout_seconds: 120
+    replay_retention_seconds: 604800
+    outbound_queue_limit: 256
+  quotas:
+    submissions_per_minute: 60
+    callbacks_per_minute: 600
+    subscriptions_per_agent: 32
+    pending_messages_per_agent: 1000
+    authentication_failures_per_minute: 30
+  mission_policy_on_disable: retain
+
+# --- Privacy-preserving telemetry, consent + data export (Stage 14E) ---
+# Local-first: the node is fully functional with this disabled. Export is OFF + PAUSED by
+# default; training + raw-artifact collection are OFF and require explicit RECORDED consent.
+# There are NO secrets here — credentials/keys are referenced by env-var NAME (never inlined),
+# and committed examples contain no real destination identifiers. Unknown consent = NOT granted.
+data_platform:
+  enabled: true
+  tenant_id: local
+  collection:
+    operational_enabled: true
+    product_analytics_enabled: false
+    training_trajectories_enabled: false      # explicit opt-in only
+    raw_artifacts_enabled: false               # separate explicit opt-in
+  export:
+    enabled: false
+    worker_enabled: true
+    paused: true
+    maximum_batch_records: 500
+    maximum_batch_bytes: 8388608               # 8 MiB
+    claim_seconds: 30
+    poll_interval_seconds: 1
+    maximum_attempts: 8
+    retry_base_seconds: 2
+    retry_max_seconds: 300
+    minimum_free_disk_bytes: 268435456         # 256 MiB
+    per_destination_concurrency: 1
+    per_tenant_pending_batches: 1000
+  privacy:
+    pseudonymization_enabled: true
+    pseudonymization_key_ref: AITHERNET_DP_PSEUDONYM_SECRET
+                                               # secret (NEVER the value); fail-closed when unset
+    pseudonymization_key_id: k1                # non-secret id recorded in lineage for rotation
+    pseudonymization_policy_version: pp1
+    redaction_policy_version: r1
+    inspect_before_export: true
+    require_training_consent: true
+    require_raw_artifact_consent: true
+  retention:
+    operational_days: 30
+    analytics_days: 90
+    training_days: 365
+    raw_artifact_days: 180
+    delivery_evidence_days: 180
+    consent_audit_days: 365
+  destinations:
+    local:
+      enabled: true
+      root: null                               # defaults under the node state root
+    ingestion:
+      enabled: false
+      base_url: null
+      tenant_id: null
+      node_id: null
+      credential_ref: null                     # env var NAME holding the node signing seed
+    google_drive:
+      enabled: false
+      folder_id: null
+      oauth_credential_ref: null               # env var NAME for the OAuth credential path
+      encryption_key_ref: null                 # env var NAME for the base64 AES-256 key
+  air_gapped:
+    enabled: false
+    bundle_root: null

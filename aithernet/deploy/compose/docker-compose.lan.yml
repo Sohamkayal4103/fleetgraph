@@ -1,0 +1,33 @@
+# =============================================================================
+# Aithernet Stage 14F — LAN-only override (private home-network beta qualification)
+# =============================================================================
+#
+# Use WITH the base file and the LAN env file, under a SEPARATE compose project so
+# its named volumes are isolated from the loopback `aithernet_local` stack:
+#
+#   docker compose --env-file /home/operator/.config/aithernet/hosted-lan.env \
+#     -p aithernet_lan \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/docker-compose.lan.yml up -d
+#
+# This override ONLY changes the reverse proxy: plain HTTP, path-routed (the same
+# Caddyfile.local used by the loopback smoke), published on a SINGLE host port
+# bound to the selected private LAN IPv4 address ONLY — never 0.0.0.0, never a
+# public interface. The bind address:port comes from AITHERNET_LAN_HTTP_BIND in
+# the env file (e.g. "10.0.0.214:8081"). All application config still comes from
+# the --env-file (development env, LAN *_BASE_URL values, dev email sink,
+# AITHERNET_HOSTED_COOKIE_SECURE=0). PostgreSQL/MinIO/control-plane/ingestion stay
+# unpublished and internal to the compose network.
+# =============================================================================
+
+services:
+  proxy:
+    # `!override` REPLACES the base 80/443 publish so the production ports are not
+    # bound. The HostIp is pinned to the private LAN address, so the port is only
+    # reachable from the trusted home subnet — not from 0.0.0.0 / public.
+    ports: !override
+      - "${AITHERNET_LAN_HTTP_BIND:?set AITHERNET_LAN_HTTP_BIND=<LAN_IP>:8081 in the env file}:80"
+    volumes:
+      - ../reverse-proxy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config

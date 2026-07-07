@@ -1,0 +1,28 @@
+# =============================================================================
+# Aithernet Stage 14F — LOCAL loopback override (development smoke / acceptance)
+# =============================================================================
+#
+# Use WITH the base file and a development env file:
+#   docker compose --env-file <dev.env> \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/docker-compose.local.yml up -d
+#
+# This override ONLY changes the reverse proxy to loopback HTTP path-routing on
+# host port 8080 (Caddyfile.local). ALL application configuration still comes
+# from the --env-file: set AITHERNET_HOSTED_ENV=development, loopback *_BASE_URL
+# values, AITHERNET_HOSTED_EMAIL=development, AITHERNET_HOSTED_STORAGE_BACKEND=local
+# and AITHERNET_HOSTED_COOKIE_SECURE=0 there. It proves NOTHING about public TLS,
+# real domains, or managed PostgreSQL. PostgreSQL is still the central DB.
+# =============================================================================
+
+services:
+  proxy:
+    # The local profile publishes ONLY a single loopback HTTP port (default 8080). `!override`
+    # REPLACES the base 80/443 publish (rather than merging), so the production ports are not
+    # bound locally and an ephemeral test stack can use its own port without colliding.
+    ports: !override
+      - "${AITHERNET_LOCAL_HTTP_PORT:-8080}:80"
+    volumes:
+      - ../reverse-proxy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config

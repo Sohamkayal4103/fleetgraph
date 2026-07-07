@@ -1,0 +1,60 @@
+[Unit]
+# Aithernet hosted telemetry ingestion — hardened service (Stage 14F).
+# Runs `python -m services.ingestion`.
+# Install:
+#   cp deploy/systemd/aithernet-ingestion.service /etc/systemd/system/
+#   cp /etc/aithernet/ingestion.env.template /etc/aithernet/ingestion.env  # edit
+#   systemctl daemon-reload && systemctl enable --now aithernet-ingestion
+Description=Aithernet hosted telemetry ingestion
+Documentation=https://example.invalid/aithernet
+After=network-online.target aithernet-control-plane.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged service identity — never root.
+User=aithernet-ingest
+Group=aithernet-ingest
+
+StateDirectory=aithernet-ingestion
+StateDirectoryMode=0750
+ConfigurationDirectory=aithernet
+RuntimeDirectory=aithernet-ingestion
+RuntimeDirectoryMode=0750
+
+WorkingDirectory=/var/lib/aithernet-ingestion
+# Secrets/config in an EnvironmentFile under /etc/aithernet, never inline.
+EnvironmentFile=/etc/aithernet/ingestion.env
+
+ExecStart=/usr/bin/env python3 -m services.ingestion
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+KillSignal=SIGINT
+TimeoutStopSec=30
+KillMode=mixed
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/aithernet-ingestion /run/aithernet-ingestion
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aithernet-ingestion
+
+[Install]
+WantedBy=multi-user.target

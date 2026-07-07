@@ -1,0 +1,65 @@
+# ---- secrets / credentials (NEVER commit) ----
+.env
+.env.*
+!.env.example
+!.env.production.example
+*.pem
+*.key
+*.p12
+*.pfx
+token.json
+*.token
+*.credentials.json
+**/identity/
+.aithernet_state/
+**/.aithernet_state/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+*.whl
+
+# ---- Node / web ----
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ---- databases / runtime state ----
+*.db
+*.sqlite
+*.sqlite3
+workspace/
+gr-mcp/
+marconi/
+lan-release*/
+
+# ---- build artifacts / archives ----
+*.tar.gz
+*.tgz
+*.zip
+*.deb
+
+# ---- editor / OS ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ---- stray files ----
+0,
+
+# ---- tooling config (as set previously) ----
+.rocketride/
+.claude/
+.github/

@@ -1,0 +1,21 @@
+From: Aithernet <packaging@example.invalid>
+Subject: [PATCH 0001] Support Python 3.12 and NumPy 1.x GNU Radio bindings
+
+Ubuntu 24.04 LTS ships GNU Radio 3.10 with Python 3.12 / NumPy 1.x bindings.
+Upstream gnuradio-mcp requires Python >=3.13; relax to >=3.12 so the component
+builds and runs against the distribution GNU Radio. This is the sole Aithernet
+change and preserves all hardware-support behavior.
+---
+diff --git a/pyproject.toml b/pyproject.toml
+index 86b949f..06968b0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
+ name = "gnuradio-mcp"
+ version = "0.1.0"
+ description = "A FastMCP server for gnuradio."
+-requires-python = ">=3.13"
++requires-python = ">=3.12"
+ dependencies = [
+     "pydantic",
+     "fastmcp",

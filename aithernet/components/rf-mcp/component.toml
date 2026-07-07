@@ -1,0 +1,63 @@
+# =============================================================================
+# Aithernet RF MCP component — canonical, reproducible source-of-truth (Stage 14F).
+#
+# The customer NEVER receives an arbitrary dirty working directory. This component
+# is rebuilt deterministically from a pinned upstream commit plus a tracked
+# Aithernet patch series, then signed and installed into a managed location
+# (default /opt/aithernet/components/rf-mcp). Aithernet launches the *installed*
+# component — never a developer checkout path.
+# =============================================================================
+
+[component]
+name = "rf-mcp"
+# Aithernet build version = <upstream version>+aithernet.<patch-series revision>.
+version = "0.1.0+aithernet.2"
+summary = "GNU Radio MCP server (FastMCP over stdio) — Aithernet-pinned RF backend."
+
+[source]
+# Canonical upstream is the ready-made yoelbassin/gr-mcp project (NOT vendored).
+upstream_url = "https://github.com/yoelbassin/gr-mcp"
+# Pinned upstream commit (main @ this SHA — includes the execute_flowgraph tool).
+upstream_commit = "8ca731e3f9a083b32170c9a0e6ee3d1e61b4f3de"
+# Aithernet patch series applied on top of the pinned upstream commit, in order.
+# These are the ONLY local changes; they preserve the Python 3.12 / NumPy 1.x
+# hardware-compat work (identical to marconi@36c78158 and the gr-mcp working tree).
+patches = [
+    "patches/0001-python312-numpy-gnuradio-compat.patch",
+    "patches/0002-bounded-receive-only-iq-acquisition-tool.patch",
+]
+patch_series_id = "aithernet-rf-mcp/0002-bounded-receive-only-iq-acquisition"
+
+[license]
+# Upstream is GPL-3.0: the corresponding source archive + LICENSE/NOTICE MUST ship
+# with every binary/component artifact (see NOTICE.md and the built *-src.tar.gz).
+spdx = "GPL-3.0-only"
+upstream_license_file = "LICENSE"
+notice_file = "NOTICE.md"
+
+[signing]
+# PINNED Aithernet component public key (PEM, shipped inside this spec dir and the .deb's
+# _component_specs). A downloaded bundle's detached signature is verified against THIS key, so the
+# trust anchor is the apt-signed .deb/spec — not the bundle's own (replaceable) key. Builds must
+# sign with the matching private key (kept outside Git, provided via SIGN_KEY).
+public_key = "aithernet-component.pub"
+
+[requirements]
+# Distribution baseline: Ubuntu 24.04 LTS amd64 ships these.
+python_min = "3.12"
+gnuradio_min = "3.10"
+
+[build]
+# The runtime env MUST be able to import the SYSTEM GNU Radio: gnuradio is an apt package
+# whose compiled bindings are tied to the system python3 (3.12 on Ubuntu 24.04). An isolated
+# uv/pyenv interpreter (different minor version, no system site-packages) cannot load them.
+# So build a system-site-packages venv on the SYSTEM python3 and install the component there.
+command = "python3 -m venv --system-site-packages .venv && .venv/bin/pip install --no-input --disable-pip-version-check ."
+
+[runtime]
+# Stdio MCP server entrypoint. Launched from the INSTALLED prefix (cwd) via the component's own
+# system-site-packages venv interpreter — a prefix-relative path, resolved at runtime, with no
+# checkout-specific absolute path baked into the spec.
+entrypoint = "main.py"
+command = ".venv/bin/python main.py"
+transport = "stdio"

@@ -1,0 +1,327 @@
+From: Aithernet <packaging@example.invalid>
+Subject: [PATCH 0002] Add bounded receive-only IQ acquisition MCP tool
+
+Adds a typed, capability-oriented tool `acquire_iq_capture` to the managed RF-MCP
+server plus the GNU Radio RX worker it runs (`gnuradio_mcp/rf_acquire.py`), so a
+physical bounded IQ acquisition traverses a REAL MCP tool boundary instead of being
+launched as a direct Aithernet subprocess. The operation is bounded IQ acquisition;
+the direction is receive only — there is no transmit field, block, or path. The tool
+independently bounds/validates every value (format, positivity, duration ceiling,
+frequency band, gain, artifact-byte cap) and rejects anything out of policy; it cannot
+be widened by the caller. GNU Radio executes beneath the MCP server. This preserves all
+existing flowgraph tools and upstream behavior.
+---
+diff --git a/src/gnuradio_mcp/models.py b/src/gnuradio_mcp/models.py
+index 5f455e3..d4cf43a 100644
+--- a/src/gnuradio_mcp/models.py
++++ b/src/gnuradio_mcp/models.py
+@@ -123,3 +123,32 @@ class ExecutionResultModel(BaseModel):
+     exit_code: int | None
+     timed_out: bool
+     duration_seconds: float
++
++
++class IqCaptureResultModel(BaseModel):
++    """Result of one bounded, receive-only IQ acquisition (the ``acquire_iq_capture`` tool).
++
++    The tool independently bounds/validates the request, runs the GNU Radio RX worker beneath the
++    MCP server, and reports facts derived from the EXECUTED capture — the artifact ``sha256`` and
++    ``bytes`` are computed here so the caller's artifact identity originates from the real result.
++    Receive-only by construction: there is no transmit field, block, or path.
++    """
++
++    status: str
++    direction: str = "rx"
++    operation: str = "bounded_iq_acquisition"
++    source: str
++    output_path: str
++    bytes: int
++    sample_count: int
++    expected_samples: int
++    sha256: str
++    stream_format: str = "CF32"
++    center_frequency_hz: float
++    sample_rate: float
++    duration_s: float
++    gain_db: float
++    block_chain: str = ""
++    interpreter: str = ""
++    plan_digest: str = ""
++    error: str = ""
+diff --git a/src/gnuradio_mcp/providers/base.py b/src/gnuradio_mcp/providers/base.py
+index 2935400..5859b46 100644
+--- a/src/gnuradio_mcp/providers/base.py
++++ b/src/gnuradio_mcp/providers/base.py
+@@ -9,6 +9,7 @@ from gnuradio_mcp.models import (
+     ConnectionModel,
+     ErrorModel,
+     ExecutionResultModel,
++    IqCaptureResultModel,
+     ParamModel,
+     PortModel,
+ )
+@@ -162,3 +163,120 @@ class PlatformProvider:
+                     timed_out=True,
+                     duration_seconds=time.time() - start,
+                 )
++
++    ##############################################
++    # Bounded receive-only IQ acquisition (Aithernet capability tool)
++    ##############################################
++
++    def acquire_iq_capture(
++        self,
++        frequency_hz: float,
++        sample_rate: float,
++        duration_s: float,
++        gain_db: float = 40.0,
++        uri: str = "",
++        device_args: str = "",
++        source: str = "iio_fmcomms2",
++        stream_format: str = "CF32",
++        max_bytes: int = 33554432,
++        plan_digest: str = "",
++        gnuradio_python: str = "",
++        antenna: str = "",
++    ) -> IqCaptureResultModel:
++        """Perform ONE bounded, RECEIVE-ONLY IQ acquisition from an SDR and return the EXECUTED
++        result (path, sample_count, bytes, sha256). The operation is bounded IQ acquisition; the
++        direction is receive only — there is no transmit path. The server INDEPENDENTLY validates
++        every value against the supported format and conservative policy and REJECTS anything out
++        of range; it cannot be widened by the caller. GNU Radio runs beneath this MCP server.
++        """
++        import hashlib
++        import json as _json
++        import os as _os
++        import subprocess
++        import sys as _sys
++        import tempfile
++        from pathlib import Path
++
++        def _fail(msg: str) -> IqCaptureResultModel:
++            return IqCaptureResultModel(
++                status="error", source=source, output_path="", bytes=0, sample_count=0,
++                expected_samples=0, sha256="", stream_format=stream_format,
++                center_frequency_hz=float(frequency_hz or 0), sample_rate=float(sample_rate or 0),
++                duration_s=float(duration_s or 0), gain_db=float(gain_db or 0),
++                plan_digest=plan_digest, error=msg)
++
++        # -- independent, server-side validation (reject widening / TX / out-of-policy) --
++        if stream_format.upper() != "CF32":
++            return _fail(f"unsupported stream_format '{stream_format}' (only CF32)")
++        if source not in ("iio_fmcomms2", "soapy"):
++            return _fail(f"unsupported source '{source}'")
++        try:
++            freq = float(frequency_hz); rate = float(sample_rate); dur = float(duration_s)
++            gain = float(gain_db); cap = int(max_bytes)
++        except (TypeError, ValueError) as exc:
++            return _fail(f"invalid numeric parameter: {exc}")
++        if not (freq > 0 and rate > 0 and dur > 0):
++            return _fail("frequency/sample_rate/duration must be > 0")
++        if dur > 30.0:
++            return _fail(f"duration {dur}s exceeds the 30s receive ceiling")
++        if not (1_000_000.0 <= freq <= 7_000_000_000.0):
++            return _fail(f"frequency {freq} Hz outside the supported 1 MHz-7 GHz band")
++        if not (0.0 <= gain <= 90.0):
++            return _fail(f"gain {gain} dB outside 0-90 dB")
++        nsamples = int(rate * dur)
++        expected_bytes = nsamples * 8  # CF32 = 8 bytes/sample
++        if cap > 0 and expected_bytes > cap:
++            return _fail(f"expected {expected_bytes} bytes exceeds artifact cap {cap}")
++
++        # -- resolve a GNU-Radio-capable interpreter (GNU Radio is a system package) --
++        interpreter = gnuradio_python.strip()
++        if not interpreter:
++            base_py = _os.path.join(_sys.base_prefix, "bin", "python3")
++            interpreter = base_py if _os.path.exists(base_py) else "/usr/bin/python3"
++
++        worker = Path(__file__).resolve().parent.parent / "rf_acquire.py"
++        if not worker.is_file():
++            return _fail("acquisition worker not found in component")
++
++        out_dir = tempfile.mkdtemp(prefix="rfmcp_iq_")
++        out_path = _os.path.join(out_dir, "capture.cf32")
++        argv = [interpreter, str(worker), "--source", source, "--freq", str(freq),
++                "--rate", str(rate), "--gain", str(gain), "--duration", str(dur),
++                "--output", out_path]
++        if source == "iio_fmcomms2":
++            argv += ["--uri", uri]
++        else:
++            argv += ["--device-args", device_args]
++            if antenna:
++                argv += ["--antenna", antenna]
++        try:
++            proc = subprocess.run(argv, capture_output=True, text=True,
++                                  timeout=min(max(dur * 8 + 15, 15), 120))
++        except subprocess.TimeoutExpired:
++            return _fail("acquisition worker timed out")
++        worker_facts = {}
++        for line in reversed((proc.stdout or "").strip().splitlines()):
++            try:
++                worker_facts = _json.loads(line)
++                break
++            except _json.JSONDecodeError:
++                continue
++        if worker_facts.get("status") != "ok" or not _os.path.exists(out_path):
++            return _fail(f"acquisition failed: {worker_facts.get('error', proc.stderr[-200:])}")
++
++        size = _os.path.getsize(out_path)
++        if cap > 0 and size > cap:
++            with __import__("contextlib").suppress(OSError):
++                _os.remove(out_path)
++            return _fail(f"produced {size} bytes exceeds artifact cap {cap}")
++        h = hashlib.sha256()
++        with open(out_path, "rb") as fh:
++            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
++                h.update(chunk)
++        return IqCaptureResultModel(
++            status="ok", direction="rx", operation="bounded_iq_acquisition", source=source,
++            output_path=out_path, bytes=size, sample_count=size // 8, expected_samples=nsamples,
++            sha256=h.hexdigest(), stream_format="CF32", center_frequency_hz=freq, sample_rate=rate,
++            duration_s=dur, gain_db=gain,
++            block_chain=worker_facts.get("block_chain", ""), interpreter=interpreter,
++            plan_digest=plan_digest)
+diff --git a/src/gnuradio_mcp/providers/mcp.py b/src/gnuradio_mcp/providers/mcp.py
+index ca98d18..f5e57de 100644
+--- a/src/gnuradio_mcp/providers/mcp.py
++++ b/src/gnuradio_mcp/providers/mcp.py
+@@ -27,6 +27,8 @@ class McpPlatformProvider:
+         self._mcp_instance.tool(self._platform_provider.save_flowgraph)
+         self._mcp_instance.tool(self._platform_provider.get_all_available_blocks)
+         self._mcp_instance.tool(self._platform_provider.execute_flowgraph)
++        # Aithernet capability tool: bounded, receive-only IQ acquisition.
++        self._mcp_instance.tool(self._platform_provider.acquire_iq_capture)
+ 
+     @property
+     def app(self) -> FastMCP:
+diff --git a/src/gnuradio_mcp/rf_acquire.py b/src/gnuradio_mcp/rf_acquire.py
+new file mode 100644
+index 0000000..c933586
+--- /dev/null
++++ b/src/gnuradio_mcp/rf_acquire.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python3
++"""Bounded GNU Radio receive-only IQ acquisition worker (shipped inside the RF-MCP component).
++
++Run as a SUBPROCESS by the ``acquire_iq_capture`` MCP tool using a GNU-Radio-capable interpreter
++(GNU Radio is a system package; the MCP server's uv venv does not contain it). Builds a minimal RX
++flowgraph ``source -> head(N) -> file_sink`` that captures EXACTLY ``rate * duration`` complex
++samples to ``--output`` as interleaved CF32 IQ, then prints a single JSON line of facts to stdout.
++
++RECEIVE ONLY — it constructs no transmit block. The ``head`` block guarantees a finite capture.
++Device addressing comes only from the bounded ``--uri`` (IIO) / ``--device-args`` (Soapy) the tool
++passes; never a shell fragment. This worker is part of the managed RF-MCP component (not Aithernet),
++so a physical acquisition runs BENEATH the MCP server, not as a direct Aithernet subprocess.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++import time
++
++
++def _build_iio(uri, freq, rate, gain, gr, iio, blocks, nsamples, output):
++    src = iio.fmcomms2_source_fc32(uri, [True, True], 0x8000)
++    src.set_frequency(int(freq))
++    src.set_samplerate(int(rate))
++    try:
++        src.set_gain_mode(0, "manual")
++        src.set_gain(0, int(gain))
++    except Exception:  # noqa: BLE001 — optional per build
++        pass
++    head = blocks.head(gr.sizeof_gr_complex, nsamples)
++    sink = blocks.file_sink(gr.sizeof_gr_complex, output, False)
++    sink.set_unbuffered(False)
++    tb = gr.top_block("rfmcp_rx_acquire", catch_exceptions=True)
++    tb.connect((src, 0), head, sink)
++    return tb
++
++
++def _build_soapy(device_args, antenna, freq, rate, gain, gr, soapy, blocks, nsamples, output):
++    src = soapy.source(device_args, "fc32", 1, "", "", [""], [""])
++    src.set_sample_rate(0, rate)
++    try:
++        src.set_gain_mode(0, False)
++    except Exception:  # noqa: BLE001
++        pass
++    src.set_frequency(0, freq)
++    src.set_gain(0, gain)
++    if antenna:
++        try:
++            src.set_antenna(0, antenna)
++        except Exception:  # noqa: BLE001
++            pass
++    head = blocks.head(gr.sizeof_gr_complex, nsamples)
++    sink = blocks.file_sink(gr.sizeof_gr_complex, output, False)
++    sink.set_unbuffered(False)
++    tb = gr.top_block("rfmcp_rx_acquire", catch_exceptions=True)
++    tb.connect(src, head, sink)
++    return tb
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--source", choices=("iio_fmcomms2", "soapy"), default="iio_fmcomms2")
++    ap.add_argument("--uri", default="", help="IIO context uri, e.g. usb:3.5.5")
++    ap.add_argument("--device-args", default="", help="Soapy device args, e.g. driver=plutosdr")
++    ap.add_argument("--freq", type=float, required=True, help="Center frequency (Hz)")
++    ap.add_argument("--rate", type=float, required=True, help="Sample rate (S/s)")
++    ap.add_argument("--gain", type=float, required=True, help="Manual RX gain (dB)")
++    ap.add_argument("--duration", type=float, required=True, help="Capture duration (s)")
++    ap.add_argument("--output", required=True, help="Output IQ file path (CF32)")
++    ap.add_argument("--antenna", default="", help="RX antenna name (Soapy; optional)")
++    args = ap.parse_args()
++
++    try:
++        from gnuradio import blocks, gr
++    except Exception as exc:  # noqa: BLE001
++        print(json.dumps({"status": "error", "error_type": type(exc).__name__,
++                          "error": "gnuradio import failed"}))
++        return 3
++
++    nsamples = int(args.rate * args.duration)
++    if nsamples <= 0:
++        print(json.dumps({"status": "error", "error": "non-positive sample count"}))
++        return 2
++
++    started = time.time()
++    try:
++        if args.source == "iio_fmcomms2":
++            from gnuradio import iio
++            uri = args.uri or "ip:pluto.local"
++            tb = _build_iio(uri, args.freq, args.rate, args.gain, gr, iio, blocks, nsamples,
++                            args.output)
++        else:
++            from gnuradio import soapy
++            tb = _build_soapy(args.device_args, args.antenna, args.freq, args.rate, args.gain,
++                              gr, soapy, blocks, nsamples, args.output)
++        tb.start()
++        tb.wait()
++        tb.stop()
++    except Exception as exc:  # noqa: BLE001
++        print(json.dumps({"status": "error", "error_type": type(exc).__name__,
++                          "error": "flowgraph failed"}))
++        return 4
++    elapsed = time.time() - started
++
++    size = os.path.getsize(args.output) if os.path.exists(args.output) else 0
++    print(json.dumps({
++        "status": "ok",
++        "source": args.source,
++        "expected_samples": nsamples,
++        "bytes": size,
++        "sample_count": size // 8,  # CF32 = 8 bytes/sample
++        "elapsed_seconds": round(elapsed, 3),
++        "sample_format": "CF32",
++        "block_chain": ("fmcomms2_source_fc32->head->file_sink"
++                        if args.source == "iio_fmcomms2"
++                        else "soapy.source->head->file_sink"),
++    }))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

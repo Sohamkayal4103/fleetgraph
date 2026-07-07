@@ -1,0 +1,67 @@
+# =============================================================================
+# Aithernet — cloudflared ingress config TEMPLATE (Cloudflare Tunnel)
+# =============================================================================
+#
+#   *** TEMPLATE ONLY — CONTAINS NO CREDENTIALS ***
+#
+# cloudflared runs on the production host as a system service. It dials OUT to
+# Cloudflare (no inbound port is opened) and forwards public hostnames to the
+# loopback origin published by the Caddy proxy (docker-compose.cloudflare.yml:
+# 127.0.0.1:${AITHERNET_ORIGIN_HTTP_BIND}, default 8087).
+#
+# Install steps (operator, on the host):
+#   1. cloudflared tunnel login                       # browser auth, one time
+#   2. cloudflared tunnel create aithernet-prod        # writes a credentials JSON
+#   3. Copy this template to the cloudflared config dir and fill the placeholders:
+#        sudo install -d -m 0750 /etc/cloudflared
+#        sudo install -m 0640 deploy/production/cloudflared/config.template.yml \
+#             /etc/cloudflared/config.yml
+#      Then set <TUNNEL-UUID> and the credentials-file path below.
+#   4. cloudflared tunnel route dns aithernet-prod app.aithernet.online
+#      cloudflared tunnel route dns aithernet-prod admin.aithernet.online
+#   5. sudo cloudflared service install   (or: systemctl enable --now cloudflared)
+#
+# The credentials JSON (~/.cloudflared/<UUID>.json) is a SECRET. Keep it at mode
+# 0600, OUTSIDE git. Never commit it. Never paste it into chat.
+# =============================================================================
+
+# The tunnel UUID printed by `cloudflared tunnel create`.
+tunnel: <TUNNEL-UUID>
+
+# Path to the tunnel credentials JSON written by `tunnel create` (mode 0600).
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+# Resilience / observability (no secrets).
+loglevel: info
+no-autoupdate: true
+
+ingress:
+  # CANONICAL customer origin: public site + /login + /app + same-origin /api. The Caddy origin
+  # path-routes app/api/status/node/download to the internal containers and reverse-proxies the
+  # marketing paths to GitHub Pages. Route `www` DNS to this tunnel (Proxied) to activate it; roll
+  # back by pointing `www` back at adityapawar0401.github.io. (Do NOT remove the GitHub Pages CNAME.)
+  - hostname: www.aithernet.online
+    service: http://127.0.0.1:8087
+    originRequest:
+      httpHostHeader: www.aithernet.online
+      connectTimeout: 10s
+
+  # LEGACY compat host. Programmatic API / node / download endpoints are proxied UNCHANGED for
+  # installed beta.4 clients; browser GET/HEAD are 302-redirected to the www equivalent by Caddy.
+  - hostname: app.aithernet.online
+    service: http://127.0.0.1:8087
+    originRequest:
+      httpHostHeader: app.aithernet.online
+      connectTimeout: 10s
+
+  # Administrator portal. Cloudflare Access MUST be applied to this hostname at
+  # the edge (see deploy/production/README.cloudflare.md). The control plane also
+  # enforces platform-admin authorization server-side.
+  - hostname: admin.aithernet.online
+    service: http://127.0.0.1:8087
+    originRequest:
+      httpHostHeader: admin.aithernet.online
+      connectTimeout: 10s
+
+  # REQUIRED terminal rule: anything else gets an explicit 404 (no open tunnel).
+  - service: http_status:404

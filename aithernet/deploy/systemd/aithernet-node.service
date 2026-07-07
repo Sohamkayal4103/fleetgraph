@@ -1,0 +1,71 @@
+[Unit]
+# Aithernet local SDR node — hardened managed runtime (Stage 14F).
+# Install:
+#   cp deploy/systemd/aithernet-node.service /etc/systemd/system/
+#   cp /etc/aithernet/aithernet.env.template /etc/aithernet/aithernet.env  # edit
+#   systemctl daemon-reload && systemctl enable --now aithernet-node
+Description=Aithernet autonomous SDR node
+Documentation=https://example.invalid/aithernet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged service identity — never root.
+User=aithernet
+Group=aithernet
+# Device access for SDR hardware (PlutoSDR/USRP via udev) without elevating.
+SupplementaryGroups=plugdev dialout
+
+# systemd-managed directories (created with correct ownership/mode under their
+# standard roots): /var/lib/aithernet, /etc/aithernet, /run/aithernet.
+StateDirectory=aithernet
+StateDirectoryMode=0750
+ConfigurationDirectory=aithernet
+RuntimeDirectory=aithernet
+RuntimeDirectoryMode=0750
+
+WorkingDirectory=/var/lib/aithernet
+# Secrets and config live in an EnvironmentFile OUTSIDE the repo, never inline.
+EnvironmentFile=/etc/aithernet/aithernet.env
+
+# Preflight gate: refuse to start if the node is misconfigured (doctor-style).
+ExecStartPre=/opt/aithernet/bin-launcher node preflight --config /etc/aithernet/node.yaml
+ExecStart=/opt/aithernet/bin-launcher start --config /etc/aithernet/node.yaml
+
+# Restart policy with bounded backoff.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Graceful stop: SIGINT lets the lifespan shut workers/RF/subprocesses down in
+# order; reap the whole tree so no gr-mcp/coordinator subprocess is orphaned.
+KillSignal=SIGINT
+TimeoutStopSec=45
+KillMode=mixed
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# Only the state root is writable under the strict system protection above.
+ReadWritePaths=/var/lib/aithernet /run/aithernet
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Logs to the journal (structured JSON on stderr).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aithernet-node
+
+[Install]
+WantedBy=multi-user.target

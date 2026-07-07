@@ -1,0 +1,10 @@
+{
+  "name": "aithernet-www-edge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Deterministic path->origin routing policy for the canonical www.aithernet.online edge (implemented by Caddyfile.cloudflare).",
+  "scripts": {
+    "test": "node --test routing.test.mjs"
+  }
+}

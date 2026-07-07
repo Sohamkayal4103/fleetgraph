@@ -1,0 +1,134 @@
+{
+  "name": "fog-occluded-pedestrian",
+  "description": "Heavy fog blinds the ambulance's lidar; a sedan near the crossing pedestrian beacons it, relayed through a hatchback, giving the ambulance early warning.",
+  "seed": 7,
+  "duration_s": 14.0,
+  "tick_hz": 5.0,
+  "world": {
+    "width": 170.0,
+    "height": 60.0,
+    "fog_density": 0.7,
+    "lidar_range_m": 55.0,
+    "brake_reaction_m": 30.0,
+    "awareness_horizon_m": 130.0
+  },
+  "actors": [
+    {
+      "id": "car-A",
+      "kind": "car",
+      "path": [
+        [
+          10.0,
+          30.0
+        ],
+        [
+          160.0,
+          30.0
+        ]
+      ],
+      "speed_mps": 12.0,
+      "spawn_t": 0.0,
+      "size": [
+        2.0,
+        4.5
+      ],
+      "is_hazard": false,
+      "has_radio": true,
+      "label": "Ambulance"
+    },
+    {
+      "id": "car-C",
+      "kind": "car",
+      "path": [
+        [
+          70.0,
+          30.0
+        ],
+        [
+          78.0,
+          30.0
+        ]
+      ],
+      "speed_mps": 0.6,
+      "spawn_t": 0.0,
+      "size": [
+        2.0,
+        4.5
+      ],
+      "is_hazard": false,
+      "has_radio": true,
+      "label": "Hatchback (relay)"
+    },
+    {
+      "id": "car-B",
+      "kind": "car",
+      "path": [
+        [
+          128.0,
+          30.0
+        ],
+        [
+          128.0,
+          30.0
+        ]
+      ],
+      "speed_mps": 0.0,
+      "spawn_t": 0.0,
+      "size": [
+        2.0,
+        4.5
+      ],
+      "is_hazard": false,
+      "has_radio": true,
+      "label": "Sedan (by crossing)"
+    },
+    {
+      "id": "truck-T",
+      "kind": "truck",
+      "path": [
+        [
+          112.0,
+          30.0
+        ],
+        [
+          112.0,
+          30.0
+        ]
+      ],
+      "speed_mps": 0.0,
+      "spawn_t": 0.0,
+      "size": [
+        2.0,
+        4.5
+      ],
+      "is_hazard": false,
+      "has_radio": false,
+      "label": "Box truck"
+    },
+    {
+      "id": "ped-1",
+      "kind": "pedestrian",
+      "path": [
+        [
+          120.0,
+          22.0
+        ],
+        [
+          120.0,
+          38.0
+        ]
+      ],
+      "speed_mps": 1.2,
+      "spawn_t": 2.0,
+      "size": [
+        2.0,
+        4.5
+      ],
+      "is_hazard": true,
+      "has_radio": false,
+      "label": "Pedestrian"
+    }
+  ],
+  "events": [],
+  "trust_pairs": null
+}

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+aithernet.db*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.env
+
+# Stage 14F operator-supplied production secrets (NEVER commit real secrets)
+.env.production
+deploy/compose/.env.production
+
+# Sandboxed coordinator/CLI runtime state (e.g. Gemini CLI runtime dir)
+.aithernet_state/
+
+gr-mcp/
+workspace/

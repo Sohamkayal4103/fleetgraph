@@ -1,0 +1,60 @@
+[Unit]
+# Aithernet hosted control plane — hardened service (Stage 14F).
+# Runs `python -m services.control_plane`.
+# Install:
+#   cp deploy/systemd/aithernet-control-plane.service /etc/systemd/system/
+#   cp /etc/aithernet/control-plane.env.template /etc/aithernet/control-plane.env  # edit
+#   systemctl daemon-reload && systemctl enable --now aithernet-control-plane
+Description=Aithernet hosted control plane
+Documentation=https://example.invalid/aithernet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged service identity — never root.
+User=aithernet-cp
+Group=aithernet-cp
+
+StateDirectory=aithernet-control-plane
+StateDirectoryMode=0750
+ConfigurationDirectory=aithernet
+RuntimeDirectory=aithernet-control-plane
+RuntimeDirectoryMode=0750
+
+WorkingDirectory=/var/lib/aithernet-control-plane
+# Secrets/config in an EnvironmentFile under /etc/aithernet, never inline.
+EnvironmentFile=/etc/aithernet/control-plane.env
+
+ExecStart=/usr/bin/env python3 -m services.control_plane
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+KillSignal=SIGINT
+TimeoutStopSec=30
+KillMode=mixed
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/aithernet-control-plane /run/aithernet-control-plane
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aithernet-control-plane
+
+[Install]
+WantedBy=multi-user.target

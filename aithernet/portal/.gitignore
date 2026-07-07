@@ -1,0 +1,5 @@
+# Hosted portal build/install artifacts — never committed.
+node_modules/
+dist/
+*.local
+.vite/

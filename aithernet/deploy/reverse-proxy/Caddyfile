@@ -1,0 +1,180 @@
+# =============================================================================
+# Aithernet Stage 14F — PRIMARY supported reverse-proxy template (Caddy)
+# =============================================================================
+#
+# Routes explicit hostnames to internal services. TLS is automatic via ACME
+# (Let's Encrypt) in production, with automatic HTTP->HTTPS redirect (Caddy
+# default). Replace the *.example.invalid placeholders with the real domain and
+# set a real ACME email. Postgres/MinIO/admin-only ports are NEVER proxied.
+#
+# For LOCAL development use deploy/reverse-proxy/Caddyfile.local instead
+# (loopback http://localhost, no ACME). A loopback block is also shown at the
+# bottom of this file, commented out.
+# =============================================================================
+
+{
+	# ACME registration email — replace with a real operator mailbox.
+	email {$ACME_EMAIL:ops@example.invalid}
+
+	# No automatic HTTP server features beyond redirect; do not act as open proxy.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Reusable security header + hardening snippet.
+(secure_headers) {
+	header {
+		# HSTS — 1 year, include subdomains, preload-eligible.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		# Remove server fingerprint.
+		-Server
+	}
+}
+
+# -----------------------------------------------------------------------------
+# Public marketing site -> public-site:8101
+# -----------------------------------------------------------------------------
+www.example.invalid {
+	import secure_headers
+	# Small request bodies for a static site.
+	request_body {
+		max_size 1MB
+	}
+	encode gzip zstd
+	reverse_proxy public-site:8101
+}
+
+# -----------------------------------------------------------------------------
+# Portal / admin SPA -> portal:8102
+# -----------------------------------------------------------------------------
+app.example.invalid {
+	import secure_headers
+	encode gzip zstd
+
+	# Authenticated release-artifact upload — the ONLY API route granted a larger (but still
+	# bounded) request body, sized for the real release artifacts (the ~16 MiB .deb, wheel, sdist,
+	# manifest, checksums, signature). Precedes the general /api handler so this allowance is
+	# route-scoped; the control plane re-enforces the same bound server-side.
+	@release_upload {
+		method POST
+		path /api/v1/releases/*/artifacts
+	}
+	handle @release_upload {
+		request_body {
+			max_size 64MB
+		}
+		uri strip_prefix /api
+		reverse_proxy control-plane:8100
+	}
+
+	# Same-origin API: the browser calls the control plane at /api on THIS host so the
+	# SameSite=lax HttpOnly session cookie + CSRF origin stay same-origin. /api is stripped
+	# before proxying. The control-plane container stays internal/unpublished.
+	handle_path /api/* {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy control-plane:8100
+	}
+
+	# Larger bounded body for telemetry/artifact uploads (path kept, not stripped).
+	@ingest path /ingest/*
+	handle @ingest {
+		request_body {
+			max_size 32MB
+		}
+		reverse_proxy ingestion:8090
+	}
+
+	# Health + downloads, path-scoped to the control plane.
+	@cp path /health/ready /v1/downloads /v1/downloads/*
+	handle @cp {
+		reverse_proxy control-plane:8100
+	}
+
+	# Default: the portal/customer/admin SPA. Websocket upgrade headers pass through.
+	handle {
+		request_body {
+			max_size 4MB
+		}
+		reverse_proxy portal:8102
+	}
+}
+
+# -----------------------------------------------------------------------------
+# Control-plane API -> control-plane:8100
+# Bounded small body for API requests. Health endpoint reachable at /health/ready.
+# -----------------------------------------------------------------------------
+api.example.invalid {
+	import secure_headers
+	request_body {
+		max_size 2MB
+	}
+	# Websocket passthrough (event/stream endpoints) — Caddy preserves the
+	# Upgrade/Connection headers; no special directive required.
+	reverse_proxy control-plane:8100
+}
+
+# -----------------------------------------------------------------------------
+# Ingestion uploads -> ingestion:8090
+# Larger bounded body (~32MB) for telemetry/artifact uploads. Readiness at
+# /ingest/v1/readiness.
+# -----------------------------------------------------------------------------
+ingest.example.invalid {
+	import secure_headers
+	request_body {
+		max_size 32MB
+	}
+	reverse_proxy ingestion:8090
+}
+
+# -----------------------------------------------------------------------------
+# Downloads -> control-plane:8100, path-scoped to /v1/downloads
+# Only the download path is exposed on this host; everything else 404s.
+# -----------------------------------------------------------------------------
+downloads.example.invalid {
+	import secure_headers
+	request_body {
+		max_size 1MB
+	}
+
+	# Only proxy the downloads path prefix; no open proxy, no directory listing.
+	@downloads path /v1/downloads /v1/downloads/*
+	handle @downloads {
+		reverse_proxy control-plane:8100
+	}
+	# Everything else is rejected.
+	handle {
+		respond "Not Found" 404
+	}
+}
+
+# =============================================================================
+# LOCAL development profile (commented out).
+# Prefer deploy/reverse-proxy/Caddyfile.local. To use inline, comment out the
+# production site blocks above and the global `email`/ACME directive, then
+# uncomment the block below:
+#
+# :80 {
+# 	# Loopback HTTP, no TLS, no ACME, no HSTS.
+# 	handle_path /ingest/* {
+# 		request_body {
+# 			max_size 32MB
+# 		}
+# 		reverse_proxy ingestion:8090
+# 	}
+# 	handle_path /api/* {
+# 		reverse_proxy control-plane:8100
+# 	}
+# 	handle /v1/downloads* {
+# 		reverse_proxy control-plane:8100
+# 	}
+# 	handle {
+# 		reverse_proxy portal:8102
+# 	}
+# }
+# =============================================================================

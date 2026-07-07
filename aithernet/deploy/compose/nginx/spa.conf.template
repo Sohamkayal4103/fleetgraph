@@ -1,0 +1,41 @@
+# SPA server config. ${NGINX_PORT} is rendered by the nginx image's envsubst at
+# container start (8102 for the portal, 8101 for the public site). $uri is NOT an
+# environment variable, so it is preserved verbatim for nginx.
+#
+# The SPA is built with an absolute asset base of /app/ (vite `base`), so fingerprinted assets are
+# served from /app/assets/ (immutable) and can never collide with the marketing site's /assets/.
+# The history-API fallback is PATH-SCOPED: only the app-owned routes return the SPA shell. Any other
+# path returns 404 rather than the SPA shell — so an unknown /api route never resolves to HTML, and
+# a stray public URL never accidentally renders the portal SPA.
+server {
+    listen ${NGINX_PORT};
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Long-lived caching for fingerprinted assets (served under the /app/ base).
+    location ^~ /app/assets/ {
+        alias /usr/share/nginx/html/assets/;
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    # App-owned SPA routes -> the SPA shell (no-store; the edge also marks these no-store). The
+    # regex lists exactly the paths the SPA owns on every host it is served: the www customer routes
+    # (/app*, /login, /logout, /status, /reset, /accept-invite) and the admin routes on the admin
+    # host (/admin*). Everything else 404s.
+    location ~ ^/(app|admin|login|logout|status|reset|accept-invite)(/|$) {
+        add_header Cache-Control "no-store";
+        try_files $uri /index.html;
+    }
+
+    # Root of a host that serves the SPA directly (legacy app-host compat) -> shell.
+    location = / {
+        try_files /index.html =404;
+    }
+
+    # Anything else is NOT an SPA route: return 404 rather than leaking the shell.
+    location / {
+        try_files $uri =404;
+    }
+}

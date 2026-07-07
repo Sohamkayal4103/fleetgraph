@@ -1,0 +1,240 @@
+# =============================================================================
+# Aithernet — PRODUCTION origin reverse proxy for a Cloudflare Tunnel deployment
+# =============================================================================
+#
+# Plain HTTP on :80, reached ONLY over the Cloudflare Tunnel (cloudflared on the
+# same host connects to the loopback-published origin port). TLS is terminated at
+# the Cloudflare edge; HTTPS is what the browser sees. There is no ACME here.
+#
+# CANONICAL CUSTOMER ORIGIN — everything customer-facing is one hostname:
+#   * ${AITHERNET_WWW_HOST}   (www.aithernet.online)   — public site + /login + /app + /api
+#       - app/auth/api/status/node/download/ingest paths  -> internal containers
+#       - everything else (marketing)                      -> GitHub Pages (aithernet-site)
+#   * ${AITHERNET_APP_HOST}   (app.aithernet.online)   — LEGACY compat host:
+#       - programmatic API / node / downloads / ingest     -> proxied UNCHANGED (installed clients)
+#       - browser GET/HEAD                                 -> 302 redirect to the www equivalent
+#   * ${AITHERNET_ADMIN_HOST} (admin.aithernet.online) — administrator portal (separate origin)
+#       - Cloudflare Access at the edge + platform-admin authz server-side (route hiding != authz)
+#
+# Cookies stay host-only (a session on www is NOT sent to admin). postgres / minio /
+# control-plane / ingestion are NEVER proxied except via the explicit routes below.
+# =============================================================================
+{
+	# No automatic HTTPS: TLS is the edge's job. This origin only speaks HTTP on :80.
+	auto_https off
+	servers {
+		protocols h1 h2c
+	}
+}
+
+# Security headers emitted on every response (the HTTPS response the edge returns to the browser).
+# frame-ancestors 'none' + X-Frame-Options DENY forbid framing; a conservative CSP; Permissions-
+# Policy denies powerful features; COOP/CORP isolate the browsing context where compatible.
+(secure_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), usb=(), payment=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		-Server
+	}
+}
+
+# Strip spoofable inbound forwarding headers at ingress. The real client IP is Cloudflare's
+# CF-Connecting-IP (the origin is loopback-only, reachable only by cloudflared); the backend never
+# trusts X-Forwarded-*. reverse_proxy re-adds its own trusted X-Forwarded-* afterwards.
+(strip_forwarded) {
+	request_header -X-Forwarded-For
+	request_header -X-Forwarded-Host
+	request_header -X-Forwarded-Proto
+	request_header -X-Forwarded-Port
+	request_header -X-Real-IP
+	request_header -Forwarded
+}
+
+# Same-origin control-plane / ingestion API routing (shared by www + app + admin). Method, body and
+# query are preserved by reverse_proxy. Authenticated/auth API responses are marked no-store so the
+# CDN never caches one user's response for another.
+(api_routes) {
+	# Authenticated release-artifact upload — the ONLY API route granted a larger (bounded) body,
+	# sized for real release artifacts. Precedes the general /api handler so the allowance is
+	# route-scoped; the control plane re-enforces it.
+	@release_upload {
+		method POST
+		path /api/v1/releases/*/artifacts
+	}
+	handle @release_upload {
+		request_body {
+			max_size 64MB
+		}
+		header Cache-Control "no-store"
+		uri strip_prefix /api
+		reverse_proxy control-plane:8100
+	}
+
+	# Same-origin browser API: /api is stripped before proxying; control-plane stays internal.
+	handle_path /api/* {
+		request_body {
+			max_size 2MB
+		}
+		header Cache-Control "no-store"
+		reverse_proxy control-plane:8100
+	}
+
+	# Bounded telemetry/artifact ingest (path preserved, not stripped).
+	@ingest path /ingest/*
+	handle @ingest {
+		request_body {
+			max_size 32MB
+		}
+		header Cache-Control "no-store"
+		reverse_proxy ingestion:8090
+	}
+
+	# Bare-path control-plane routes accessed WITHOUT /api: health probe, public verification-key +
+	# release metadata, and the SIGNED NODE endpoints (enroll/heartbeat/config/release/downloads).
+	# Installed nodes talk to the bare base URL, not /api — these must be byte-stable.
+	@cp path /health/ready /health/diagnostics /v1/public/releases /v1/downloads /v1/downloads/* /v1/node/*
+	handle @cp {
+		reverse_proxy control-plane:8100
+	}
+}
+
+# The portal/customer/admin SPA shell (path-routed). The HTML shell + auth pages are no-store; the
+# fingerprinted /app/assets/* are immutable (set by the SPA container). Internal only.
+(spa_routes) {
+	@spa_assets path /app/assets/*
+	handle @spa_assets {
+		reverse_proxy portal:8102
+	}
+	@spa_shell path /app /app/* /login /logout /status /reset /accept-invite
+	handle @spa_shell {
+		header Cache-Control "no-store"
+		reverse_proxy portal:8102
+	}
+}
+
+# Marketing static site (GitHub Pages, repo aithernet-site). Caddy sets the upstream Host to the
+# canonical domain so GitHub Pages serves the site WITHOUT its custom-domain redirect (SNI stays the
+# github.io name for a valid cert). The spec's clean, extensionless routes are rewritten to the
+# published .html files; "/", directories and already-extensioned assets pass through untouched.
+(marketing_proxy) {
+	@clean {
+		method GET HEAD
+		not path /
+		not path *.*
+		not path */
+	}
+	rewrite @clean {path}.html
+	reverse_proxy https://adityapawar0401.github.io {
+		header_up Host www.aithernet.online
+		transport http {
+			tls_server_name adityapawar0401.github.io
+		}
+	}
+}
+
+# =============================================================================
+# CANONICAL CUSTOMER ORIGIN: www.aithernet.online
+# =============================================================================
+:80 {
+	import secure_headers
+
+	@www host {$AITHERNET_WWW_HOST:www.aithernet.online}
+	handle @www {
+		import strip_forwarded
+		encode gzip zstd
+		import api_routes
+		import spa_routes
+		# Default: the static marketing site.
+		handle {
+			import marketing_proxy
+		}
+	}
+
+	# ---------------------------------------------------------------------------
+	# LEGACY compat host: app.aithernet.online
+	#   - programmatic API / node / download / ingest  -> proxied UNCHANGED (matched FIRST)
+	#   - browser GET/HEAD                              -> 302 redirect to the www equivalent
+	#     (302 during qualification; promote to permanent/301 after monitoring — see docs §15)
+	# ---------------------------------------------------------------------------
+	@app host {$AITHERNET_APP_HOST:app.aithernet.online}
+	handle @app {
+		import strip_forwarded
+		encode gzip zstd
+
+		# 1. API / node / programmatic — preserve exactly (installed beta.4 clients). NEVER redirect.
+		import api_routes
+
+		# 2. Browser deep links -> www equivalents (query preserved). GET/HEAD only; a stray
+		#    POST/PUT/etc to a browser path is not a real client and gets the SPA/404 below.
+		@app_get method GET HEAD
+		handle @app_get {
+			@root path /
+			redir @root https://www.aithernet.online/app 302
+
+			@signin path /signin /sign-in
+			redir @signin https://www.aithernet.online/login 302
+
+			@invite path /accept-invite /accept-invite/*
+			redir @invite https://www.aithernet.online/app/accept-invite?{query} 302
+
+			@statusp path /status
+			redir @statusp https://www.aithernet.online/status 302
+
+			# /portal/* -> /app/* (strip the /portal prefix, keep the remainder + query).
+			@portal path /portal /portal/*
+			handle @portal {
+				uri strip_prefix /portal
+				redir https://www.aithernet.online/app{uri} 302
+			}
+
+			# /app*, /login, /logout already match the canonical shape on www.
+			@applike path /app /app/* /login /logout
+			redir @applike https://www.aithernet.online{uri} 302
+
+			# Anything else on the legacy host that a browser requests: send it to the site root.
+			redir https://www.aithernet.online/ 302
+		}
+
+		# 3. Non-GET to a non-API path on the legacy host: serve the SPA shell (compat), else it is
+		#    a stray request — the SPA container returns its path-scoped 404.
+		import spa_routes
+		handle {
+			reverse_proxy portal:8102
+		}
+	}
+
+	# ---------------------------------------------------------------------------
+	# ADMINISTRATOR origin: admin.aithernet.online (Cloudflare Access at the edge).
+	#   Same SPA + API, path-routed at /admin/*. Admin HTML/API are no-store.
+	# ---------------------------------------------------------------------------
+	@admin host {$AITHERNET_ADMIN_HOST:admin.aithernet.online}
+	handle @admin {
+		import strip_forwarded
+		encode gzip zstd
+		import api_routes
+		@admin_assets path /app/assets/*
+		handle @admin_assets {
+			reverse_proxy portal:8102
+		}
+		@admin_shell path /admin /admin/* /login /logout /app /app/*
+		handle @admin_shell {
+			header Cache-Control "no-store"
+			reverse_proxy portal:8102
+		}
+		# Admin default -> SPA shell (the SPA routes /admin* to the admin portal).
+		handle {
+			header Cache-Control "no-store"
+			reverse_proxy portal:8102
+		}
+	}
+
+	# Only the three known hostnames are served; everything else (raw-IP / probe traffic that
+	# somehow reaches the loopback origin) gets an explicit 404 (no open tunnel).
+	handle {
+		respond "Not Found" 404
+	}
+}

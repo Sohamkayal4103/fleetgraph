@@ -1,0 +1,349 @@
+# =============================================================================
+# Aithernet Stage 14F — single-host production-oriented compose stack
+# =============================================================================
+#
+#   *** SINGLE-HOST DEPLOYMENT PROFILE ***
+#   Public TLS with a real domain, a managed/HA PostgreSQL, and externally
+#   reachable hostnames remain operational verification steps this profile does
+#   NOT prove (see deploy/production/README.md).
+#
+# Reproducible from a CLEAN CLONE — every build input is tracked. Supply all
+# settings + secrets through an operator env file (NEVER committed):
+#
+#   docker compose --env-file /etc/aithernet/hosted.env \
+#     -f deploy/compose/docker-compose.yml config
+#   docker compose --env-file /etc/aithernet/hosted.env \
+#     -f deploy/compose/docker-compose.yml build
+#   docker compose --env-file /etc/aithernet/hosted.env \
+#     -f deploy/compose/docker-compose.yml up -d
+#   docker compose --env-file /etc/aithernet/hosted.env \
+#     -f deploy/compose/docker-compose.yml --profile tasks run --rm migrate
+#
+# The env file supplies every ${VAR} below; required values use ${VAR:?...} so a
+# missing/empty value FAILS CLOSED at `config` time. Central DB is PostgreSQL.
+# =============================================================================
+
+# Tracked multi-stage build for the application image (control plane + ingestion).
+x-app-build: &app-build
+  context: ../..
+  dockerfile: deploy/compose/Dockerfile
+
+# Tracked multi-stage build for the frontend image (builds portal/ from source).
+x-frontend-build: &frontend-build
+  context: ../..
+  dockerfile: deploy/compose/Dockerfile.frontend
+
+# Application environment, interpolated from the operator env file (--env-file).
+# Required values use ${VAR:?...}; optional references default to empty.
+x-app-env: &app-env
+  AITHERNET_HOSTED_ENV: "${AITHERNET_HOSTED_ENV:-production}"
+  AITHERNET_HOSTED_DATABASE_URL: "${AITHERNET_HOSTED_DATABASE_URL:?set AITHERNET_HOSTED_DATABASE_URL in the env file}"
+  AITHERNET_HOSTED_SESSION_KEY: "${AITHERNET_HOSTED_SESSION_KEY:?set AITHERNET_HOSTED_SESSION_KEY in the env file}"
+  AITHERNET_HOSTED_COOKIE_SECURE: "${AITHERNET_HOSTED_COOKIE_SECURE:-1}"
+  AITHERNET_AUTO_APPROVE_EARLY_ACCESS: "${AITHERNET_AUTO_APPROVE_EARLY_ACCESS:-0}"
+  AITHERNET_TURNSTILE_REQUIRED: "${AITHERNET_TURNSTILE_REQUIRED:-0}"
+  AITHERNET_TURNSTILE_SECRET: "${AITHERNET_TURNSTILE_SECRET:-}"
+  AITHERNET_HOSTED_EMAIL: "${AITHERNET_HOSTED_EMAIL:-smtp}"
+  AITHERNET_HOSTED_SMTP_URL: "${AITHERNET_HOSTED_SMTP_URL:-}"
+  AITHERNET_HOSTED_EMAIL_FROM: "${AITHERNET_HOSTED_EMAIL_FROM:-}"
+  AITHERNET_HOSTED_EMAIL_REPLY_TO: "${AITHERNET_HOSTED_EMAIL_REPLY_TO:-}"
+  AITHERNET_HOSTED_EMAIL_TIMEOUT: "${AITHERNET_HOSTED_EMAIL_TIMEOUT:-30}"
+  AITHERNET_HOSTED_STORAGE_BACKEND: "${AITHERNET_HOSTED_STORAGE_BACKEND:-local}"
+  AITHERNET_HOSTED_BLOB_ROOT: "${AITHERNET_HOSTED_BLOB_ROOT:-/var/lib/aithernet/blobs}"
+  AITHERNET_HOSTED_BOOTSTRAP: "${AITHERNET_HOSTED_BOOTSTRAP:-0}"
+  AITHERNET_HOSTED_S3_ENDPOINT: "${AITHERNET_HOSTED_S3_ENDPOINT:-}"
+  AITHERNET_HOSTED_S3_ACCESS_KEY: "${AITHERNET_HOSTED_S3_ACCESS_KEY:-}"
+  AITHERNET_HOSTED_S3_SECRET_KEY: "${AITHERNET_HOSTED_S3_SECRET_KEY:-}"
+  AITHERNET_PUBLIC_SITE_BASE_URL: "${AITHERNET_PUBLIC_SITE_BASE_URL:?set AITHERNET_PUBLIC_SITE_BASE_URL in the env file}"
+  AITHERNET_PORTAL_BASE_URL: "${AITHERNET_PORTAL_BASE_URL:?set AITHERNET_PORTAL_BASE_URL in the env file}"
+  AITHERNET_ADMIN_BASE_URL: "${AITHERNET_ADMIN_BASE_URL:-}"
+  AITHERNET_CONTROL_PLANE_BASE_URL: "${AITHERNET_CONTROL_PLANE_BASE_URL:?set AITHERNET_CONTROL_PLANE_BASE_URL in the env file}"
+  AITHERNET_INGESTION_BASE_URL: "${AITHERNET_INGESTION_BASE_URL:?set AITHERNET_INGESTION_BASE_URL in the env file}"
+  AITHERNET_DOWNLOAD_BASE_URL: "${AITHERNET_DOWNLOAD_BASE_URL:?set AITHERNET_DOWNLOAD_BASE_URL in the env file}"
+  AITHERNET_RELEASE_SIGNING_KEY: "${AITHERNET_RELEASE_SIGNING_KEY:-}"
+  AITHERNET_RELEASE_PUBLIC_KEY: "${AITHERNET_RELEASE_PUBLIC_KEY:-}"
+  AITHERNET_RELEASE_SIGNING_KEY_ID: "${AITHERNET_RELEASE_SIGNING_KEY_ID:-}"
+  AITHERNET_RELEASE_SIGNING_KEYS: "${AITHERNET_RELEASE_SIGNING_KEYS:-}"
+  AITHERNET_RELEASE_MAX_ARTIFACT_BYTES: "${AITHERNET_RELEASE_MAX_ARTIFACT_BYTES:-}"
+  AITHERNET_HOSTED_ADMIN_EMAIL: "${AITHERNET_HOSTED_ADMIN_EMAIL:-}"
+  AITHERNET_HOSTED_ADMIN_PASSWORD: "${AITHERNET_HOSTED_ADMIN_PASSWORD:-}"
+  AITHERNET_DP_PSEUDONYM_SECRET: "${AITHERNET_DP_PSEUDONYM_SECRET:-}"
+  AITHERNET_DRIVE_CREDENTIALS_REF: "${AITHERNET_DRIVE_CREDENTIALS_REF:-}"
+  AITHERNET_DRIVE_FOLDER_ID: "${AITHERNET_DRIVE_FOLDER_ID:-}"
+  AITHERNET_DRIVE_ENCRYPTION_KEY_REF: "${AITHERNET_DRIVE_ENCRYPTION_KEY_REF:-}"
+  # Owner-archive Google OAuth (server-side; admin/owner only). Optional: when unset the admin
+  # portal shows "Google Drive OAuth is not configured on the server". The client SECRET is read
+  # from GOOGLE_OAUTH_CLIENT_SECRET; it is never logged or returned to any browser.
+  GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID:-}"
+  GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET:-}"
+  GOOGLE_OAUTH_REDIRECT_URI: "${GOOGLE_OAUTH_REDIRECT_URI:-}"
+  GOOGLE_OAUTH_ARCHIVE_ROOT_NAME: "${GOOGLE_OAUTH_ARCHIVE_ROOT_NAME:-}"
+  AITHERNET_BACKUP_DESTINATION: "${AITHERNET_BACKUP_DESTINATION:-}"
+  AITHERNET_BACKUP_ENCRYPTION_KEY_REF: "${AITHERNET_BACKUP_ENCRYPTION_KEY_REF:-}"
+  INGEST_DATABASE_URL: "${INGEST_DATABASE_URL:?set INGEST_DATABASE_URL in the env file}"
+  INGEST_BLOB_ROOT: "${INGEST_BLOB_ROOT:-/var/lib/aithernet/ingest-blobs}"
+  INGEST_ADMIN_TOKEN: "${INGEST_ADMIN_TOKEN:?set INGEST_ADMIN_TOKEN in the env file}"
+  INGEST_DECRYPTION_KEY_REF: "${INGEST_DECRYPTION_KEY_REF:-}"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Reverse proxy — the ONLY service with published host ports. Terminates TLS,
+  # routes per-hostname to internal services. Never exposes postgres/minio.
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ACME_EMAIL: "${ACME_EMAIL:-ops@example.invalid}"
+    volumes:
+      - ../reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      ingestion:
+        condition: service_healthy
+      portal:
+        condition: service_healthy
+      public-site:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - frontend
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Control plane — REST/API + downloads. Internal only. Port 8100.
+  # ---------------------------------------------------------------------------
+  control-plane:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["python", "-m", "services.control_plane"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      AITHERNET_HOSTED_HOST: "0.0.0.0"
+      AITHERNET_HOSTED_PORT: "8100"
+    volumes:
+      - blobs:/var/lib/aithernet/blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health/ready', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Ingestion service — telemetry/upload intake. Internal only. Port 8090.
+  # ---------------------------------------------------------------------------
+  ingestion:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["python", "-m", "services.ingestion"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      INGEST_HOST: "0.0.0.0"
+      INGEST_PORT: "8090"
+    volumes:
+      - ingest_blobs:/var/lib/aithernet/ingest-blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/ingest/v1/readiness', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Background worker (OPTIONAL, `worker` profile). The control plane processes
+  # background work in-process by default; this is an idle placeholder.
+  # ---------------------------------------------------------------------------
+  worker:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["python", "-c", "import time; print('worker placeholder: control-plane runs work in-process', flush=True); time.sleep(2**31)"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    volumes:
+      - blobs:/var/lib/aithernet/blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - worker
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Portal / customer / admin SPA — built FROM SOURCE by Dockerfile.frontend.
+  # Internal only. Serves on 8102 (no committed dist, no host mounts).
+  # ---------------------------------------------------------------------------
+  portal:
+    build: *frontend-build
+    image: aithernet/frontend:latest
+    restart: unless-stopped
+    environment:
+      NGINX_PORT: "8102"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8102/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Public site SPA — same tracked image, served on 8101. Internal only.
+  # ---------------------------------------------------------------------------
+  public-site:
+    build: *frontend-build
+    image: aithernet/frontend:latest
+    restart: unless-stopped
+    environment:
+      NGINX_PORT: "8101"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8101/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — central database. Internal only; NEVER published to the host.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-aithernet}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the env file}"
+      POSTGRES_DB: "${POSTGRES_DB:-aithernet}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aithernet} -d ${POSTGRES_DB:-aithernet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object store. Internal only; NEVER published.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER in the env file}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in the env file}"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # DB migrations — one-shot (`tasks` profile). Run before first start + upgrades.
+  # ---------------------------------------------------------------------------
+  migrate:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["python", "-m", "services.control_plane.cli", "migrate"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    profiles:
+      - tasks
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Admin bootstrap — one-shot (`tasks` profile). Reads AITHERNET_HOSTED_ADMIN_*.
+  # ---------------------------------------------------------------------------
+  bootstrap-admin:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["python", "-m", "services.control_plane.cli", "admin", "bootstrap",
+              "--email", "${AITHERNET_HOSTED_ADMIN_EMAIL:-ops@example.invalid}"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    profiles:
+      - tasks
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Backup — one-shot (`backup` profile). Writes a logical dump into the volume.
+  # ---------------------------------------------------------------------------
+  backup:
+    build: *app-build
+    image: aithernet/control-plane:latest
+    command: ["sh", "-c",
+              "python -m services.control_plane.cli backup --output /backups/aithernet-backup-$(date +%Y%m%dT%H%M%S).json"]
+    environment:
+      <<: *app-env
+    volumes:
+      - backups:/backups
+      - blobs:/var/lib/aithernet/blobs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    profiles:
+      - backup
+    networks:
+      - backend
+
+networks:
+  frontend:
+  backend:
+    internal: false
+
+volumes:
+  postgres_data:
+  minio_data:
+  blobs:
+  ingest_blobs:
+  backups:
+  caddy_data:
+  caddy_config:

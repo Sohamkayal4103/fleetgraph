@@ -1,0 +1,65 @@
+# =============================================================================
+# Aithernet — PRODUCTION override for a Cloudflare Tunnel deployment
+# =============================================================================
+#
+# Use WITH the base file, the production env file, and a SEPARATE compose project
+# (`aithernet_prod`) so its named volumes are isolated from the loopback
+# `aithernet_local` and `aithernet_lan` staging stacks:
+#
+#   AITHERNET_COMPOSE_PROJECT=aithernet_prod \
+#   AITHERNET_COMPOSE_OVERLAY=docker-compose.cloudflare.yml \
+#   deploy/production/install.sh --env-file /etc/aithernet/hosted.env
+#
+# What this override changes versus the base (ACME/public-port) profile:
+#
+#   * The reverse proxy publishes ONE port bound to LOOPBACK ONLY
+#     (127.0.0.1:${AITHERNET_ORIGIN_HTTP_BIND}), reachable only by `cloudflared`
+#     running on the same host. There is NO public 80/443 bind, no ACME, and no
+#     inbound router/NAT port. Cloudflare terminates TLS at the edge; the tunnel
+#     forwards to this loopback origin over plain HTTP that never leaves the host.
+#   * The proxy serves Caddyfile.cloudflare (host-routed plain HTTP for
+#     app.aithernet.online + admin.aithernet.online; postgres/minio/control-plane/
+#     ingestion stay internal and unpublished — identical to the base).
+#   * Bounded JSON logs (size + rotation) on every long-running service.
+#
+# Everything else (images, healthchecks, internal networks, fail-closed required
+# vars) comes from the base file. PostgreSQL/MinIO/control-plane/ingestion are
+# NEVER published to the host in either profile.
+# =============================================================================
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  proxy:
+    # `!override` REPLACES the base 80/443 publish. The HostIp is pinned to
+    # 127.0.0.1 so the origin is reachable ONLY from the host's loopback (i.e.
+    # from cloudflared) — never from 0.0.0.0, the LAN, or the public Internet.
+    ports: !override
+      - "127.0.0.1:${AITHERNET_ORIGIN_HTTP_BIND:-8087}:80"
+    environment:
+      # Hostnames the origin answers for (used by Caddyfile.cloudflare host matchers).
+      AITHERNET_WWW_HOST: "${AITHERNET_WWW_HOST:?set AITHERNET_WWW_HOST=www.aithernet.online in the env file}"
+      AITHERNET_APP_HOST: "${AITHERNET_APP_HOST:?set AITHERNET_APP_HOST=app.aithernet.online in the env file}"
+      AITHERNET_ADMIN_HOST: "${AITHERNET_ADMIN_HOST:?set AITHERNET_ADMIN_HOST=admin.aithernet.online in the env file}"
+    volumes:
+      - ../reverse-proxy/Caddyfile.cloudflare:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *bounded-logging
+
+  control-plane:
+    logging: *bounded-logging
+  ingestion:
+    logging: *bounded-logging
+  portal:
+    logging: *bounded-logging
+  public-site:
+    logging: *bounded-logging
+  postgres:
+    logging: *bounded-logging
+  minio:
+    logging: *bounded-logging

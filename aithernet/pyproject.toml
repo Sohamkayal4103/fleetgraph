@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aithernet"
+version = "1.0.0-beta.9"
+description = "Autonomous SDR node runtime — node foundation, coordinator agent (Gemini CLI / OpenAI-compatible / Anthropic), coding agent, GNU Radio MCP client + integration diagnostics, decision routing / mission-step execution, an external-agent connection interface, and a web dashboard (missions, tasks, tool calls, steps, agents, events, API, CLI, browser UI)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Aithernet" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "typer>=0.12",
+    "pydantic>=2.6",
+    "sqlalchemy>=2.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+aithernet = "aithernet.cli:main"
+aithernet-hosted = "services.control_plane.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aithernet", "services"]
+
+# Ship the managed-component source-of-truth specs (component.toml + patch series + NOTICE +
+# reproducible build.sh) INSIDE the installed distribution so `aithernet components plan/install`
+# works from the .deb/wheel without the source repository or any developer checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"components/rf-mcp" = "aithernet/_component_specs/rf-mcp"
+
+[tool.hatch.build.targets.sdist]
+# The authoritative `python -m build` must yield a CLEAN source distribution directly from a
+# normal checkout — only project source, migrations, templates, scripts, packaging files and the
+# docs needed to build/install. It must NEVER carry frontend dependency trees / build output,
+# local-environment files, secrets/keys, node identities, runtime or Docker-volume databases,
+# local artifact/release stores, or the external RF checkouts. (Hatchling's default sdist walks
+# the working tree, so on-disk-but-untracked junk like node_modules is excluded explicitly here.)
+exclude = [
+  ".env", ".env.*", "**/.env", "**/.env.*",
+  "node_modules", "**/node_modules",
+  "dist", "**/dist",
+  "build", "**/build",
+  ".venv", "**/.venv",
+  "**/__pycache__", "**/.pytest_cache", "**/.ruff_cache", "**/.mypy_cache", "**/.vite",
+  "*.db", "*.sqlite", "*.sqlite3", "**/*.db", "**/*.sqlite", "**/*.sqlite3",
+  "*.whl", "*.deb", "*.tar.gz", "**/*.whl", "**/*.deb", "**/*.tar.gz",
+  "*.pem", "*.key", "*.p12", "*.pfx", "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx",
+  "**/*credential*", "**/*oauth*", "**/*secret*", "**/identity/*",
+  ".claude", "**/.claude",
+  ".aithernet_state", "**/.aithernet_state",
+  "workspace", "gr-mcp", "marconi",
+  "lan-release", "lan-release-beta2",
+  "0,",
+  # Internal-only qualification/acceptance transcripts — engineering evidence the customer source
+  # distribution does not need (kept in-repo; never shipped). Customer-facing docs (customer-cli.md,
+  # rf-mcp-component.md) and provenance/reproducibility docs are retained.
+  "docs/beta5-candidate.md",
+  "docs/beta8-candidate.md",
+  "docs/regression-evidence.md",
+  "docs/customer-journey-acceptance.md",
+  "docs/clean-machine-acceptance.md",
+  "docs/phase4-clean-client-runbook.md",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = [
+  "hardware: requires a physical SDR / vendor RF toolchain (not run in a clean CI sandbox)",
+  "env_dependent: requires a live app-lifespan server / external service (Postgres/MinIO/network)",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's `Depends(...)` in defaults is the documented idiom.
+# UP042: the str+Enum mix guarantees JSON serialization across Pydantic versions.
+ignore = ["UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/aithernet/api/*" = ["B008"]
+# FastAPI's `Depends(...)` in defaults is the documented idiom (hosted control-plane API).
+"services/control_plane/app.py" = ["B008"]
+# Typer's `Option(...)` in defaults is the documented idiom for these CLIs.
+"services/control_plane/cli.py" = ["B008"]
+"src/aithernet/hosted/cli.py" = ["B008"]

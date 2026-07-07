@@ -1,0 +1,75 @@
+# =============================================================================
+# Aithernet Stage 14F — LOCAL development reverse-proxy (Caddy, loopback HTTP)
+# =============================================================================
+#
+# Pure loopback HTTP. No ACME, no TLS, no HSTS. Used by the
+# docker-compose.local.yml override for the `deploy acceptance` smoke. NOT for
+# any public or production deployment.
+#
+# Single localhost host with path-based routing so the whole stack is reachable
+# on one port (mapped to host 8080 by the local compose override).
+# =============================================================================
+
+{
+	# Disable automatic HTTPS entirely for local loopback.
+	auto_https off
+}
+
+:80 {
+	# Basic hardening still applied; HSTS deliberately omitted for plain HTTP.
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	# Ingestion uploads (larger bodies) — path prefix /ingest/.
+	@ingest path /ingest/*
+	handle @ingest {
+		request_body {
+			max_size 32MB
+		}
+		reverse_proxy ingestion:8090
+	}
+
+	# Authenticated release-artifact upload — the ONLY API route granted a larger (but still
+	# bounded) request body, sized for the real release artifacts (the ~16 MiB .deb, wheel, sdist,
+	# manifest, checksums, signature). It must precede the general /api handler so this larger
+	# allowance applies only here; the control plane re-enforces the same bound server-side.
+	@release_upload {
+		method POST
+		path /api/v1/releases/*/artifacts
+	}
+	handle @release_upload {
+		request_body {
+			max_size 64MB
+		}
+		uri strip_prefix /api
+		reverse_proxy control-plane:8100
+	}
+
+	# Control-plane API — path prefix /api/ (stripped) and health passthrough.
+	handle_path /api/* {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy control-plane:8100
+	}
+
+	@health path /health/ready
+	handle @health {
+		reverse_proxy control-plane:8100
+	}
+
+	# Downloads path-scoped to control plane.
+	@downloads path /v1/downloads /v1/downloads/*
+	handle @downloads {
+		reverse_proxy control-plane:8100
+	}
+
+	# Default: portal SPA. (Swap to public-site:8101 to smoke the public site.)
+	handle {
+		reverse_proxy portal:8102
+	}
+}

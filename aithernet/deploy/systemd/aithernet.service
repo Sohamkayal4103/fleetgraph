@@ -1,0 +1,54 @@
+[Unit]
+# Aithernet node — managed long-running runtime (Stage 14A).
+# Copy to /etc/systemd/system/aithernet.service, edit the User/paths/EnvironmentFile, then:
+#   systemctl daemon-reload && systemctl enable --now aithernet
+Description=Aithernet autonomous SDR node
+Documentation=https://example.invalid/aithernet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aithernet
+Group=aithernet
+
+# Working-directory independence: the node uses node_state_root from its config, never the CWD.
+WorkingDirectory=/var/lib/aithernet
+# The config file and any secrets live in an EnvironmentFile, never inline on the command line.
+EnvironmentFile=/etc/aithernet/aithernet.env
+ExecStartPre=/opt/aithernet/.venv/bin/aithernet node preflight --config /etc/aithernet/node.yaml
+ExecStart=/opt/aithernet/.venv/bin/aithernet start --config /etc/aithernet/node.yaml
+
+# Restart policy with bounded backoff.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Graceful stop: SIGINT lets the lifespan shut workers/RF/subprocesses down in order.
+KillSignal=SIGINT
+TimeoutStopSec=45
+# Reap the whole process tree so no gr-mcp/coordinator/coding subprocess is orphaned.
+KillMode=mixed
+
+# Readiness/health: systemd can gate dependents on the readiness probe (see notify variant).
+# A simple liveness watchdog can curl http://127.0.0.1:8080/health/ready.
+
+# Hardening — kept compatible with GNU Radio / MCP subprocesses (no NoNewPrivileges that would
+# break some SDR tooling; tighten further per deployment after validation).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/aithernet
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+
+# Logs go to the journal (structured JSON on stderr). Use logrotate for the file handler.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aithernet
+
+[Install]
+WantedBy=multi-user.target
