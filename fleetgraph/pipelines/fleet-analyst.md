@@ -1,69 +1,64 @@
 # RocketRide "Fleet Analyst" pipeline
 
-The agent brain that answers questions about a FleetGraph run by traversing the Neo4j graph. Build
-it in the RocketRide VS Code extension, then **one-click deploy to cloud.rocketride.ai**. The
-FleetGraph app calls the deployed webhook automatically when `ROCKETRIDE_WEBHOOK_URL` is set
-(see `.env`); otherwise it falls back to the local `/ask` catalog.
+The cloud brain that turns a plain-English question about a FleetGraph run into a **read-only Neo4j
+Cypher query**. It runs on **RocketRide** (`pipelines/fleet-analyst.pipe`), the LLM node calls the
+**Butterbase** AI gateway, and the FastAPI app runs the returned Cypher against **Neo4j** Aura and
+phrases the rows — so all three mandatory sponsors are load-bearing in one flow.
 
-This pipeline makes **all three mandatory sponsors load-bearing in one flow**: the LLM nodes run
-through **Butterbase's** AI gateway, the middle node queries **Neo4j** Aura, and the whole thing runs
-as a managed **RocketRide** cloud endpoint the app calls.
+## Why this shape (and not a single linear pipeline)
 
-## Nodes (wire them in this order)
+RocketRide has **no first-class Neo4j / Cypher node** (confirmed against the component docs — the
+documented DB nodes are `db_postgres`/`db_mysql`, SQL-only and agent-invoked). So the graph query
+can't live *inside* a linear pipeline. Instead:
 
 ```
-[Webhook input]  →  [LLM: Cypher generator]  →  [Neo4j: run query]  →  [LLM: answer]  →  [Text output]
-   question,           question + schema           $rid = run_id          rows → 1 line
-   run_id              → read-only Cypher
+   app /ask ──question──▶ RocketRide chat pipeline ──Cypher──▶ app runs it on Neo4j ──rows──▶ Butterbase phrases ──▶ answer
+                          (chat → llm_openai → response_answers)
 ```
 
-### 1. Input — **Webhook**
-Receives JSON `{ "question": "...", "run_id": "run-fog-occluded-pedestrian" }`.
+RocketRide owns the hard NL→Cypher reasoning (the "analyst"); the app owns the graph I/O. Clean,
+deterministic, and every generated query is validated read-only before it touches the database.
 
-### 2. **LLM (OpenAI-Compatible API)** — "Cypher generator"
-- **Base URL / API key**: your Butterbase AI gateway (`BUTTERBASE_GATEWAY_URL`, `BUTTERBASE_API_KEY`).
-- **System prompt**:
-  ```
-  You translate a question about a V2V driving simulation into ONE read-only Neo4j Cypher query.
-  Output ONLY the Cypher, no prose, no code fences. Always scope every relationship by {run_id:$rid}.
-  Never use CREATE/MERGE/DELETE/SET/REMOVE. Return at most 25 rows.
+## The pipeline (`fleet-analyst.pipe`)
 
-  Graph schema:
-    (:Car {id,label}) (:Hazard {id,kind,label}) (:Run {id})
-    (:Car)-[:TRUSTS {run_id}]->(:Car)
-    (:Car)-[:OBSERVED {run_id,distance}]->(:Hazard)        // saw it with its own lidar
-    (:Car)-[:BLIND_TO {run_id,reason}]->(:Hazard)          // should see it but can't
-    (:Car)-[:BEACONED {run_id,hazard,snr,hop,frames}]->(:Car)   // one delivered radio hop
-    (:Car)-[:RELAYED {run_id,hazard,dest}]->(:Hazard)      // forwarded someone else's beacon
-    (:Car)-[:AWARE_OF {run_id,via,hops}]->(:Hazard)
-    (:Car)-[:BRAKED_FOR {run_id,distance,source}]->(:Hazard)
-    (:Car)-[:AT_RISK {run_id,distance}]->(:Hazard)         // near a hazard it never knew about
-  A relay chain is B-[:BEACONED]->C-[:BEACONED]->A (C relayed for A).
-  ```
-- **User prompt**: `{{question}}`
-- Output → the Cypher string.
+A stable `chat` pipeline — `chat → llm_openai → response_answers`:
 
-### 3. **Neo4j** node — "run query"
-- **URI** `neo4j+s://7a6461d0.databases.neo4j.io` · **user** `7a6461d0` · **database** `7a6461d0` · **password** (your Aura password)
-- **Query**: `{{cypher generator output}}`
-- **Parameters**: `{ "rid": "{{run_id}}" }`
-- Output → rows (JSON).
+- **chat** source — emits the `questions` lane (driven from Python via `client.chat()`).
+- **llm_openai** ("analyst") — profile `butterbase`, pointed at the Butterbase AI gateway
+  (`${ROCKETRIDE_GATEWAY_URL}` / `${ROCKETRIDE_GATEWAY_KEY}` / `${ROCKETRIDE_MODEL}`). Consumes
+  `questions`, emits `answers`.
+- **response_answers** — returns the `answers` lane (`response["answers"][0]` = the Cypher).
 
-### 4. **LLM (OpenAI-Compatible API)** — "answer"
-- Same Butterbase gateway creds.
-- **System prompt**: `Explain these graph-query rows in ONE concise sentence. Use ONLY the rows; name the relay path if present. No preamble.`
-- **User prompt**: `Question: {{question}}\nRows: {{neo4j rows}}`
+The **graph schema + Cypher rules + few-shot examples are supplied per request** via the `Question`
+object (`addInstruction` / `addContext` / `addExample` / `addGoal` in `fleetgraph/rocketride_client.py`),
+so the pipeline itself stays generic and prompt-free.
 
-### 5. Output — **Text Output**
-Return JSON so the app can render it: `{ "question": "{{question}}", "answer": "{{answer}}", "cypher": "{{cypher}}", "rows": {{rows}}, "relay_path": <optional> }`.
+> ⚠️ **One field to confirm on deploy.** The offline RocketRide docs don't document a custom
+> base-URL field for `llm_openai`, so the `.pipe` uses `endpoint` as the best guess. When you connect
+> your RocketRide account, `check.py` validates against the live server; if `endpoint` is wrong, open
+> the regenerated `.rocketride/schema/llm_openai.json` (`Pipe.schema.dependencies.profile.oneOf`) for
+> the real field name. If `llm_openai` has no custom-endpoint field at all, switch the node to
+> `llm_anthropic` (native Claude) or a native `llm_openai` OpenAI key — the app flow is unchanged.
 
-## Deploy + connect
-1. **Deploy** the pipeline to cloud.rocketride.ai → copy the **webhook URL**.
-2. Put it in `fleetgraph/.env`:  `ROCKETRIDE_WEBHOOK_URL=https://cloud.rocketride.ai/…/webhook`
-3. Restart `./dev.sh`. Now every "Ask" in the app calls your **deployed RocketRide endpoint** (the
-   answer card shows "via RocketRide ☁️"); if the cloud is unreachable it silently falls back to
-   local Cypher so the demo never breaks.
+## Setup + connect
 
-## Guardrails (already in the prompts)
-Read-only only (no writes), every query scoped by `run_id`, ≤25 rows — so a generated query can't
-mutate or leak across runs.
+1. `pip install rocketride` (already in the fleetgraph venv).
+2. Set **`ROCKETRIDE_URI`** + **`ROCKETRIDE_APIKEY`** in `fleetgraph/.env` (from the RocketRide VS Code
+   extension settings, or cloud.rocketride.ai). The app injects the gateway creds from its existing
+   `BUTTERBASE_*` vars automatically.
+3. `cd pipelines && python check.py` — verifies env + pipeline structure; once a key is set it
+   connects, validates, and reports the real `llm_openai` base-URL field.
+4. Restart `./dev.sh`. Now any **free-form** "Ask" (one not in the local catalog) is routed to the
+   RocketRide analyst → Cypher → Neo4j → Butterbase phrasing; the answer card shows "via RocketRide ☁️".
+   Catalog questions still use their hand-written Cypher, and if RocketRide is unset/unreachable the
+   app falls back to the catalog so the demo never breaks.
+
+The app **`use()`s the `.pipe` directly** at runtime (no separate deploy needed). To also host it as a
+managed/scheduled endpoint, `client.deploy.add(pipeline)` (see `client.deploy.list/status/update/remove`).
+
+## Guardrails
+
+- The Question instructions force **read-only Cypher, scoped by `{run_id:$rid}`, ≤25 rows**.
+- `rocketride_client.is_readonly_cypher()` **rejects** any generated query containing
+  `CREATE/MERGE/DELETE/SET/REMOVE/DROP/DETACH/CALL/LOAD/FOREACH` before it runs — so a bad generation
+  can neither mutate nor break out of the run scope.

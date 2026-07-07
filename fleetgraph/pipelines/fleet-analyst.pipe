@@ -1,0 +1,33 @@
+{
+  "project_id": "2929653c-9a01-4b54-999e-981a59125db4",
+  "source": "chat_in",
+  "description": "FleetGraph Analyst — turns a plain-English question about a V2V driving run into ONE read-only Neo4j Cypher query. The graph schema + rules are supplied per request via the Question object; the FastAPI app runs the returned Cypher against Neo4j Aura and phrases the rows.",
+  "components": [
+    {
+      "id": "chat_in",
+      "provider": "chat",
+      "config": { "hideForm": true, "mode": "Source", "parameters": {}, "type": "chat" }
+    },
+    {
+      "id": "analyst",
+      "provider": "llm_openai",
+      "config": {
+        "profile": "butterbase",
+        "butterbase": {
+          "apikey": "${ROCKETRIDE_GATEWAY_KEY}",
+          "model": "${ROCKETRIDE_MODEL}",
+          "endpoint": "${ROCKETRIDE_GATEWAY_URL}",
+          "modelTotalTokens": 16384
+        },
+        "parameters": {}
+      },
+      "input": [{ "lane": "questions", "from": "chat_in" }]
+    },
+    {
+      "id": "out",
+      "provider": "response_answers",
+      "config": { "laneName": "answers" },
+      "input": [{ "lane": "answers", "from": "analyst" }]
+    }
+  ]
+}
