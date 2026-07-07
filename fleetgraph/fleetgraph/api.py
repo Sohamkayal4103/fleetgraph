@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from fleetgraph import butterbase
 from fleetgraph import butterbase_backend as bb
+from fleetgraph import rocketride_client as rr
 from fleetgraph.engine import RunResult, run_scenario
 from fleetgraph.neo4j_sync import GraphSync
 from fleetgraph.scenario import (
@@ -309,50 +310,57 @@ async def _persist_ask(*, question: str, run_id: str, cypher: str | None,
 
 @app.post("/ask")
 async def ask(req: AskRequest, authorization: str | None = Header(default=None)) -> dict:
-    """Answer a graph question. If a deployed RocketRide pipeline is configured we call it (it does
-    NL->Cypher->answer in the cloud); otherwise we run the catalog Cypher locally and — if the
-    Butterbase gateway is configured — phrase the answer in plain English through it."""
-    user = await bb.user_from_token(_bearer(authorization)) if bb.is_configured() else None
+    """Answer a graph question, grounded in a real Neo4j traversal.
 
-    rr_url = os.environ.get("ROCKETRIDE_WEBHOOK_URL")
-    if rr_url and req.question:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=60.0) as c:
-                r = await c.post(rr_url, json={"question": req.question, "run_id": req.run_id})
-            if r.status_code < 400:
-                data = r.json()
-                await _persist_ask(question=data.get("question", req.question), run_id=req.run_id,
-                                   cypher=data.get("cypher"), rows=data.get("rows"),
-                                   answer=data.get("answer"), user=user)
-                return {"source": "rocketride", **data}
-        except Exception:  # noqa: BLE001 — fall back to local if the cloud pipeline is unreachable
-            pass
+    Catalog questions use their hand-written Cypher. A free-form question with no catalog match is
+    sent to the deployed RocketRide "fleet analyst", which returns a read-only Cypher query we run
+    here (RocketRide has no Neo4j node). Either way the rows are phrased in one sentence via the
+    Butterbase gateway. Falls back to the catalog when RocketRide is unset/unreachable so the demo
+    never breaks."""
+    user = await bb.user_from_token(_bearer(authorization)) if bb.is_configured() else None
 
     gs = _sync()
     if gs is None:
         raise HTTPException(503, "Neo4j not configured (set NEO4J_URI/USER/PASSWORD/DATABASE).")
+
     qid = req.question_id or (_match_question(req.question) if req.question else None)
-    if qid not in ASK_CATALOG:
+    cypher: str | None = None
+    question_label: str | None = None
+    source = "local"
+    if qid in ASK_CATALOG:
+        entry = ASK_CATALOG[qid]
+        cypher, question_label = entry["cypher"].strip(), entry["q"]
+    elif req.question and rr.is_configured():
+        gen = await rr.generate_cypher(req.question, req.run_id)   # RocketRide: NL -> read-only Cypher
+        if gen:
+            cypher, question_label, source = gen, req.question, "rocketride"
+
+    if cypher is None:
         gs.close()
-        raise HTTPException(400, "Could not map the question to a graph query. "
-                                 "Pick one from /ask/catalog.")
-    entry = ASK_CATALOG[qid]
+        hint = ("Pick one from /ask/catalog." if not rr.is_configured()
+                else "Pick one from /ask/catalog, or rephrase — the analyst couldn't turn that into a query.")
+        raise HTTPException(400, f"Could not map the question to a graph query. {hint}")
+
     try:
         with gs._driver.session(database=gs._database) as s:
-            rows = [dict(r) for r in s.run(entry["cypher"], rid=req.run_id)]
+            rows = [dict(r) for r in s.run(cypher, rid=req.run_id)]
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a generated query that won't run shouldn't 500
+        raise HTTPException(422, f"Graph query failed: {type(exc).__name__}: {exc}") from exc
     finally:
         gs.close()
+
     answer_text = None
     if butterbase.is_configured() and rows:
         try:
-            answer_text = await butterbase.phrase_answer(entry["q"], rows)
+            answer_text = await butterbase.phrase_answer(question_label, rows)
         except butterbase.ButterbaseError:
             answer_text = None
-    await _persist_ask(question=entry["q"], run_id=req.run_id, cypher=entry["cypher"].strip(),
+    await _persist_ask(question=question_label, run_id=req.run_id, cypher=cypher,
                        rows=rows, answer=answer_text, user=user)
-    return {"question": entry["q"], "question_id": qid, "cypher": entry["cypher"].strip(),
-            "rows": rows, "answer": answer_text, "grounded": True, "source": "local"}
+    return {"question": question_label, "question_id": qid, "cypher": cypher,
+            "rows": rows, "answer": answer_text, "grounded": True, "source": source}
 
 
 # --------------------------------------------------------------------------- auth + credits
