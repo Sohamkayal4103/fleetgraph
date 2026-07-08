@@ -7,6 +7,12 @@ mesh. Every perception, beacon, relay hop, and braking decision is written to a 
 an agent **traverses** that graph to answer questions a SQL join can't express cleanly — *"why did the
 ambulance brake for a pedestrian it never saw?"* → the exact relay path that warned it.
 
+## ▶️ Watch the 3-minute demo
+
+[![FleetGraph — 3-minute demo](https://img.youtube.com/vi/M3zUnrmp3yc/maxresdefault.jpg)](https://youtu.be/M3zUnrmp3yc)
+
+*(click the image — a narrated walkthrough: the fog relay, asking the graph, a jammer attack, city grids, and how the three sponsors fit together.)*
+
 > **Deployed app:** https://fleetgraph.butterbase.dev
 > **Demo scenarios:** fog + relay, jammer silences the mesh, highway stalled-car, and 2D city **grids**
 > with turning routes, traffic signals, and intersections.
